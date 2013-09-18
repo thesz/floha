@@ -78,8 +78,16 @@ data VarID = VarID (Maybe String) Int
 
 -- |Floha expression structure.
 data FE a where
-	FEConst :: a -> FE a
+	-- |Constant expression.
+	FEConst :: BitRepr a => a -> FE a
+	-- |Variable.
 	FEVar :: VarID -> FE a
+	-- |Wildcard. Wildcards can be seen in both sides of rules.
+	-- In left side it means that we won't check readyness of appropriate
+	-- header expression.
+	-- In the right side it means that we won't change appropriate header
+	-- variable or output.
+	FEWild :: FE a
 
 -- |Lift HList to the HList of Floha expressions.
 type family LiftFE ts
@@ -105,14 +113,19 @@ actor name body = flip evalState startABState $ do
 net :: String -> Actor ins outs
 net name = error "net is not yet ready."
 
-rules :: a -> b -> ActorBodyM ()
-rules _ _ = error "rules not yet done!"
+rules :: (Match matchE, Change changeE) => (matchE, changeE) -> [(matchE, changeE)] -> ActorBodyM ()
+rules direction matchChanges = error "rules not yet done!"
 
+-- | @-->@ is just an operator version of tuple constructor.
+infix 9 -->
 (-->) :: a -> b -> (a,b)
 a --> b = (a,b)
 
 auto :: ActorBodyM (FE a)
 auto = inventVar
+
+__ :: FE a
+__ = FEWild
 
 -------------------------------------------------------------------------------
 -- Implementation.
@@ -149,3 +162,15 @@ instance FEList feList => FEList (FE a :. feList) where
 		return $ fe :. feList
 
 
+class Match match where
+	-- |Check that header is OK.
+	_matchHeader :: match -> ActorBodyM ()
+
+class Change change where
+	_change :: change -> ActorBodyM ()
+
+instance Match (FE a) where
+	_matchHeader fe = case fe of
+		FEConst a -> error "constant in the left side of rule header."
+		FEVar v -> return ()
+		FEWild -> error "wildcard in the left side of rule header."

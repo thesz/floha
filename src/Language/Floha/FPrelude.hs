@@ -1,6 +1,6 @@
 -- |FPrelude.hs
 --
--- Prelude - combinators and handy functions for Floha.
+-- Floha Prelude - combinators and handy functions for Floha.
 --
 -- Copyright (C) 2013 Serguey Zefirov.
 
