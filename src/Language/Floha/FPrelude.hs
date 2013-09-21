@@ -11,6 +11,15 @@ module Language.Floha.FPrelude where
 import Language.Floha.Base
 
 -------------------------------------------------------------------------------
+-- Types for packetized streams.
+
+data SOP = NoSOP | SOP
+	deriving (Eq, Ord, Show)
+
+data EOP = NoEOP | EOP
+	deriving (Eq, Ord, Show)
+
+-------------------------------------------------------------------------------
 -- Basic actors.
 
 -- |Mapping actor.
@@ -30,6 +39,21 @@ zipWithA f = actorN "zipWith" ("a" :. "b" :. Nil) $ \(a :. b :. Nil) -> do
 	rules ((a, b) --> o)
 		[ (a,b) --> f a b]
 	return (o :. Nil)
+
+-- |Folding actor for packetized streams.
+-- It won't work properly if there's data between final EOP and initial SOP.
+-- (but it is not valid Avalon stream anyway)
+foldA :: BitRepr b => b -> (FE a -> FE b -> FE b) -> Actor ((SOP, EOP, a) :. Nil) (b :. Nil)
+foldA b0 foldF = actorN "fold" ("a" :. Nil) $ \(a :. Nil) -> do
+	b <- autoN "b"
+	initial b b0
+	o <- autoN "o"
+	rules ((a, b, foldF b a) --> (b,o))
+		-- if we encounter EOP, output next value, remember initial b0.
+		[ (tuple (__, pEOP, a), b) --> (constant b0, b)
+		-- no EOP, no output.
+		, (tuple (__, __, a), b) --> (b, __)
+		]
 
 -------------------------------------------------------------------------------
 -- Actors for packetized streams (with SOP and EOP).

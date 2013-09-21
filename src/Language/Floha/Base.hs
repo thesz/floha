@@ -5,21 +5,28 @@
 -- Copyright (C) 2013 Serguey Zefirov.
 
 {-# LANGUAGE GADTs, TypeFamilies, TypeOperators, FlexibleContexts, FlexibleInstances #-}
-{-# LANGUAGE GeneralizedNewtypeDeriving, TemplateHaskell, PatternGuards #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving, TemplateHaskell, PatternGuards, ScopedTypeVariables #-}
 
 module Language.Floha.Base
 	( (:.)(..)
 	, Nil(..)
+	, BitRepr(..)
 	, FE(..)
 	, (-->)
 	, LiftFE
+	, Tuple(..)
 	, Actor(..)
 	, actor
 	, actorN
 	, ActorBody
 	, auto
 	, autoN
+	, initial
+	, __
 	, rules
+	, constant
+	, Logic(..)
+	, AddSub(..)
 	, net
 	) where
 
@@ -51,7 +58,7 @@ type family Plus a b
 type instance Plus Z b = b
 type instance Plus (S a) b = S (Plus a b)
 
-newtype NatI = NatI Integer
+newtype NatI = NatI { fromNatI :: Integer}
 	deriving (Eq, Ord, Show, Num)
 
 class Nat a where
@@ -80,8 +87,8 @@ class Nat (BitSize a) => BitRepr a where
 	typeBitSize _ = realizeNat
 
 	-- |Get the bit size of the type.
-	bitSize :: a -> NatI
-	bitSize a = natValue (typeBitSize a)
+	bitReprSize :: a -> NatI
+	bitReprSize a = natValue (typeBitSize a)
 
 	-- |Safe value. In most cases @decode 0@ suffice, but
 	-- for "one of N" encoding this is not the case.
@@ -93,12 +100,6 @@ class Nat (BitSize a) => BitRepr a where
 
 	-- |Decode the value from bit vector.
 	decode :: BitVectConst -> a
-
-instance BitRepr Bool where
-	type BitSize Bool = S Z
-	safeValue = False
-	encode = BitVectConst . fromIntegral . fromEnum
-	decode = toEnum . fromIntegral . fromBitVectConst
 
 -------------------------------------------------------------------------------
 -- HList.
@@ -113,44 +114,26 @@ data BitVect size = BitVect
 
 -- |Floha expression structure.
 data FE a where
-	-- |Constant expression.
-	FEConst :: BitRepr a => a -> FE a
-	-- |Variable.
-	FEVar :: VarID -> FE a
-	-- |Wildcard. Wildcards can be seen in both sides of rules.
-	-- In left side it means that we won't check readyness of appropriate
-	-- header expression.
-	-- In the right side it means that we won't change appropriate header
-	-- variable or output.
-	FEWild :: FE a
-	FEBin :: BinOp left right result -> FE left -> FE right -> FE result
-
--- |Binary operations.
-data BinOp left right result where
-	Plus :: AddSub a => BinOp a a a
-	Minus :: AddSub a => BinOp a a a
-	Concat :: BinOp (BitVect lsize) (BitVect rsize) (BitVect (Plus lsize rsize))
-	And :: BinOp Bool Bool Bool
-	Or :: BinOp Bool Bool Bool
-	BWAnd :: BitWise a => BinOp a a a
-	BWOr :: BitWise a => BinOp a a a
-	BWXor :: BitWise a => BinOp a a a
+	FELow :: SizedLFE -> FE a
 
 -- |Untyped and sized expressions for generating Verilog or VHDL code.
 -- Every expression is accompanied by its size.
 data LowFE =
-		LFEConst	Integer
+		LFEConst	BitVectConst
 	|	LFEVar		VarID
+	|	LFEWild
+	|	LFEReady	(Maybe VarID)
 	|	LFEBin		LFWBinOp	SizedLFE	SizedLFE
+	|	LFECat		[SizedLFE]
 	deriving (Eq, Ord, Show)
 
 -- |Binary operations for LowFE. Note that there is no distinction between bitwise and logical operations.
 -- This is so because they are identical for Verilog and can be made so for VHDL.
-data LFWBinOp = LBPlus | LBMinus | LBAnd | LBOr | LBXor
+data LFWBinOp = Plus | Minus | And | Or | Xor
 	deriving (Eq, Ord, Show)
 
 -- |Sized low FE is a pair of LowFE value and it's size.
-type SizedLFE = (LowFE, Int)
+type SizedLFE = (NatI, LowFE)
 
 -- |Class to describe basic arithmetic operations.
 class AddSub a where
@@ -158,18 +141,19 @@ class AddSub a where
 
 -- |How FE supports them.
 instance AddSub a => AddSub (FE a) where
-	(.+) = FEBin Plus
-	(.-) = FEBin Minus
+	FELow a@(size,_) .+ FELow b = FELow $ (size, LFEBin Plus a b)
+	FELow a@(size,_) .- FELow b = FELow $ (size, LFEBin Minus a b)
 
 -- |Class to describe bitwise operations like .&. and .|. from Data.Bits.Bits.
-class BitWise a where
+-- It is also suitable for logical connectives.
+class Logic a where
 	(.&), (.|) ,(.^) :: a -> a -> a
 
 -- |Support for BitWise for FE's.
-instance BitWise a => BitWise (FE a) where
-	(.&) = FEBin BWAnd
-	(.|) = FEBin BWOr
-	(.^) = FEBin BWXor
+instance Logic a => Logic (FE a) where
+	FELow a@(size,_) .& FELow b = FELow (size, LFEBin And a b)
+	FELow a@(size,_) .| FELow b = FELow (size, LFEBin Or a b)
+	FELow a@(size,_) .^ FELow b = FELow (size, LFEBin Xor a b)
 
 -- |Lift HList to the HList of Floha expressions.
 type family LiftFE ts
@@ -180,6 +164,14 @@ type instance LiftFE (t :. ts) = FE t :. LiftFE ts
 type family StringList ts
 type instance StringList Nil = Nil
 type instance StringList (n :. ns) = String :. StringList ns
+
+class Tuple tup where
+	-- |Transformation at type level - from (FE a, FE b) to FE (a,b)
+	type FETuple tup
+
+	-- |The code for transformation.
+	tuple :: tup -> FETuple tup
+
 
 -- |Floha actor.
 data Actor ins outs where
@@ -217,23 +209,35 @@ infix 9 -->
 (-->) :: a -> b -> (a,b)
 a --> b = (a,b)
 
-auto :: ActorBodyM (FE a)
+auto :: BitRepr a => ActorBodyM (FE a)
 auto = inventVar Nothing
 
-autoN :: String -> ActorBodyM (FE a)
+autoN :: BitRepr a => String -> ActorBodyM (FE a)
 autoN = inventVar . Just
 
-__ :: FE a
-__ = FEWild
+__ :: BitRepr a => FE a
+__ = r
+	where
+		r = FELow (size, LFEWild)
+		toA :: BitRepr a => FE a -> a
+		toA _ = error "toA in __ is forced!"
+		size = fromIntegral $ fromNatI $ bitReprSize $ toA r
 
+-- |Create a constant FE.
 constant :: BitRepr a => a -> FE a
-constant = FEConst
+constant a = FELow (fromIntegral $ fromNatI $ bitReprSize a, LFEConst $ encode a)
+
+-- |Initial assignment for variable.
+initial :: BitRepr a => FE a -> a -> ActorBodyM ()
+initial (FELow (_,LFEVar vid)) a = do
+	modify $ \abs -> abs { absInitials = Map.insert vid (bitReprSize a, LFEConst (encode a)) $ absInitials abs }
 
 -------------------------------------------------------------------------------
 -- Implementation.
 
 data ABState = ABS {
 	  absUnique		:: Int
+	, absInitials		:: Map.Map VarID SizedLFE
 	}
 
 type ActorBodyM a = State ABState a
@@ -243,13 +247,25 @@ type ActorBody ins outs = ins -> ActorBodyM outs
 startABState :: ABState
 startABState = ABS {
 	  absUnique		= 0
+	, absInitials		= Map.empty
 	}
 
 _unique :: ActorBodyM Int
 _unique = modify (\abs -> abs { absUnique = absUnique abs + 1 }) >> liftM absUnique get
 
-inventVar :: Maybe String -> ActorBodyM (FE a)
-inventVar name = liftM (FEVar . VarID name) _unique
+_inventVarID :: Maybe String -> ActorBodyM VarID
+_inventVarID name = liftM (VarID name) _unique
+
+inventVar :: BitRepr a => Maybe String -> ActorBodyM (FE a)
+inventVar name = liftM mkR $ _inventVarID name
+	where
+		mkR :: BitRepr a => VarID -> FE a
+		mkR varID = r
+			where
+				r = FELow (size, LFEVar varID)
+				toA :: BitRepr a => FE a -> a
+				toA _ = error "toA was forced!"
+				size = fromIntegral $ fromNatI $ bitReprSize $ toA r
 
 class FEList feList where
 	inventList :: Maybe (StringList feList) -> ActorBodyM feList
@@ -257,7 +273,7 @@ class FEList feList where
 instance FEList Nil where
 	inventList _ = return Nil
 
-instance FEList feList => FEList (FE a :. feList) where
+instance (BitRepr a, FEList feList) => FEList (FE a :. feList) where
 	inventList names = do
 		fe <- inventVar name
 		feList <- inventList names'
@@ -284,23 +300,56 @@ class Change change where
 	_change :: change -> ActorBodyM (FE Bool)
 
 instance Match (FE a) where
-	_matchHeader fe = case fe of
-		FEConst a -> error "constant in the left side of rule header."
-		FEVar v -> return ()
-		FEWild -> error "wildcard in the left side of rule header."
-		FEBin _ _ _ -> return ()
+	_matchHeader (FELow (size,lfe)) = matchLFE lfe
+		where
+			matchLFE lfe = case lfe of
+				LFEConst a -> error "constant in the left side of rule header."
+				LFEVar v -> return ()
+				LFEWild -> error "wildcard in the left side of rule header."
+				LFEBin _ (_,a) (_,b) -> matchLFE a >> matchLFE b
+	_matchReady (FELow sizedLFE) = do
+		(c, renames) <- mkReady sizedLFE
+		return (FELow c, renames)
+		where
+			mkReady (size, lfe) = case lfe of
+				LFEVar a -> _inventVarID Nothing >>= return . (,) (1, LFEReady $ Just a)  . Map.singleton a
+				LFEWild -> return (lfe', Map.empty)
+					where
+						FELow lfe' = constant True
+				LFEBin _ a b -> liftM2 combine (mkReady a) (mkReady b)
+					where
+						combine (r1, d1) (r2, d2) = ((1,LFEBin And r1 r2), Map.unionWithKey (\k -> error $ "non-linear match for "++show k) d1 d2)
 
 instance Change (FE a) where
-	_changeHeader fe = case fe of
-		FEVar _ -> return ()
+	_changeHeader (FELow (_, lfe)) = case lfe of
+		LFEVar _ -> return ()
 		_ -> error "only variables are allowed in right hand of rule header."
-	_changeRename map e@(FEVar v)
-		| Just v' <- Map.lookup v map = FEVar v'
-		| otherwise = e
-	_changeRename map e = case e of
-		FEBin op a b -> FEBin op (_changeRename map a) (_changeRename map b)
-		_ -> e
+	_changeRename map (FELow (size, lfe)) = FELow $ (,) size $ renameLFE lfe
+		where
+			renameLFE lfe = case lfe of
+				LFEVar varid 
+					| Just v' <- Map.lookup varid map -> LFEVar v'
+					| otherwise -> lfe
+				LFEBin op (size1, a) (size2, b) -> LFEBin op (size1, renameLFE a) (size2, renameLFE b)
+				_ -> lfe
 	_change e = return $ constant False
+
+-------------------------------------------------------------------------------
+-- Instances of various classes for various types.
+
+instance BitRepr Bool where
+	type BitSize Bool = S Z
+	safeValue = False
+	encode = BitVectConst . fromIntegral . fromEnum
+	decode = toEnum . fromIntegral . fromBitVectConst
+
+instance Logic Bool where
+	(.&) = (&&)
+	(.|) = (||)
+	a .^ b = (a .& not b) .| (not a .& b)
+
+-------------------------------------------------------------------------------
+-- Trivial derivable instance for header tuples, BitRepr, etc.
 
 $(liftM concat $ forM [2..8] $ \n -> let
 		names = map (TH.mkName . ("a"++) . show) [1..n]
@@ -310,10 +359,13 @@ $(liftM concat $ forM [2..8] $ \n -> let
 		changeN = TH.mkName "Change"
 		matchC t = TH.ConT (TH.mkName "Match") `TH.AppT` t
 		changeC t = TH.ConT (TH.mkName "Change") `TH.AppT` t
+		tupleC t = TH.ConT (TH.mkName "Tuple") `TH.AppT` t
 		matchPred t = TH.ClassP matchN [t]
 		changePred t = TH.ClassP changeN [t]
 		tupleT ts = foldl TH.AppT (TH.TupleT (length ts)) ts
-		match = TH.InstanceD (map matchPred fes) (matchC $ tupleT fes) []
-		change = TH.InstanceD (map changePred fes) (changeC $ tupleT fes) []
-	in return [match, change]
+		tupleFEs = tupleT fes
+		match = TH.InstanceD (map matchPred fes) (matchC tupleFEs) []
+		change = TH.InstanceD (map changePred fes) (changeC tupleFEs) []
+		tuple = TH.InstanceD [] (tupleC tupleFEs) []
+	in return [match, change, tuple]
  )
