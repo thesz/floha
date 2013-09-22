@@ -4,7 +4,7 @@
 --
 -- Copyright (C) 2013 Serguey Zefirov.
 
-{-# LANGUAGE TypeOperators #-}
+{-# LANGUAGE TypeOperators, TemplateHaskell #-}
 
 module Language.Floha.FPrelude where
 
@@ -18,6 +18,8 @@ data SOP = NoSOP | SOP
 
 data EOP = NoEOP | EOP
 	deriving (Eq, Ord, Show)
+
+$(deriveBitRepr [''SOP, ''EOP])
 
 -------------------------------------------------------------------------------
 -- Basic actors.
@@ -50,7 +52,7 @@ foldA b0 foldF = actorN "fold" ("a" :. Nil) $ \(a :. Nil) -> do
 	o <- autoN "o"
 	rules ((a, b, foldF b a) --> (b,o))
 		-- if we encounter EOP, output next value, remember initial b0.
-		[ (tuple (__, pEOP, a), b) --> (constant b0, b)
+		[ (tuple (__, feEOP, a), b) --> (constant b0, b)
 		-- no EOP, no output.
 		, (tuple (__, __, a), b) --> (b, __)
 		]

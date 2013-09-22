@@ -28,6 +28,7 @@ module Language.Floha.Base
 	, Logic(..)
 	, AddSub(..)
 	, net
+	, deriveBitRepr
 	) where
 
 import Control.Monad
@@ -347,6 +348,9 @@ instance Logic Bool where
 	(.&) = (&&)
 	(.|) = (||)
 	a .^ b = (a .& not b) .| (not a .& b)
+
+deriveBitRepr :: [TH.Name] -> TH.Q [TH.Dec]
+deriveBitRepr names = return []
 
 -------------------------------------------------------------------------------
 -- Trivial derivable instance for header tuples, BitRepr, etc.
