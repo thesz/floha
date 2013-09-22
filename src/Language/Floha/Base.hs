@@ -6,6 +6,7 @@
 
 {-# LANGUAGE GADTs, TypeFamilies, TypeOperators, FlexibleContexts, FlexibleInstances #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving, TemplateHaskell, PatternGuards, ScopedTypeVariables #-}
+{-# LANGUAGE UndecidableInstances #-}
 
 module Language.Floha.Base
 	( (:.)(..)
@@ -231,14 +232,22 @@ constant a = FELow (fromIntegral $ fromNatI $ bitReprSize a, LFEConst $ encode a
 -- |Initial assignment for variable.
 initial :: BitRepr a => FE a -> a -> ActorBodyM ()
 initial (FELow (_,LFEVar vid)) a = do
-	modify $ \abs -> abs { absInitials = Map.insert vid (bitReprSize a, LFEConst (encode a)) $ absInitials abs }
+	_setInitial vid (bitReprSize a, LFEConst (encode a))
 
 -------------------------------------------------------------------------------
 -- Implementation.
 
 data ABState = ABS {
+	-- |Generating unique indices.
 	  absUnique		:: Int
+	-- |Initial values for the variables.
 	, absInitials		:: Map.Map VarID SizedLFE
+	-- |Ready signals for match header tuple element positions.
+	, absMatchReady		:: Map.Map Int SizedLFE
+	-- |Register signals as inputs.
+	, absInputs		:: Set.Set SizedLFE
+	-- |And also register signals as outputs.
+	, absOutputs		:: Set.Set SizedLFE
 	}
 
 type ActorBodyM a = State ABState a
@@ -249,6 +258,9 @@ startABState :: ABState
 startABState = ABS {
 	  absUnique		= 0
 	, absInitials		= Map.empty
+	, absMatchReady		= Map.empty
+	, absInputs		= Set.empty
+	, absOutputs		= Set.empty
 	}
 
 _unique :: ActorBodyM Int
@@ -257,16 +269,34 @@ _unique = modify (\abs -> abs { absUnique = absUnique abs + 1 }) >> liftM absUni
 _inventVarID :: Maybe String -> ActorBodyM VarID
 _inventVarID name = liftM (VarID name) _unique
 
+_setInitial :: VarID -> SizedLFE -> ActorBodyM ()
+_setInitial v init = modify $ \abs -> abs { absInitials = Map.insert v init $ absInitials abs }
+
 inventVar :: BitRepr a => Maybe String -> ActorBodyM (FE a)
-inventVar name = liftM mkR $ _inventVarID name
+inventVar name = do
+	v <- _inventVarID name
+	let (r, initial) = mkR v
+	_setInitial v initial
+	return r
 	where
-		mkR :: BitRepr a => VarID -> FE a
-		mkR varID = r
+		mkR :: BitRepr a => VarID -> (FE a, SizedLFE)
+		mkR varID = (r, initial)
 			where
 				r = FELow (size, LFEVar varID)
 				toA :: BitRepr a => FE a -> a
 				toA _ = error "toA was forced!"
 				size = fromIntegral $ fromNatI $ bitReprSize $ toA r
+				initial = (size, LFEConst $ encode $ safeValue `asTypeOf` toA r)
+
+_setReady :: FE a -> Int -> ActorBodyM ()
+_setReady (FELow lfe) n = do
+	r <- computeReady lfe
+	modify $ \abs -> abs { absMatchReady = Map.insert n r $ absMatchReady abs }
+	where
+		computeReady (_, LFEVar v) = return (1,LFEReady $ Just v)
+		computeReady (_, LFEBin _ a b) =
+			liftM2 (\a b -> (1, LFEBin And a b)) (computeReady a) (computeReady b)
+		computeReady e = error $ "internal: compute ready does not handle "++show e
 
 class FEList feList where
 	inventList :: Maybe (StringList feList) -> ActorBodyM feList
@@ -349,6 +379,7 @@ instance Logic Bool where
 	(.|) = (||)
 	a .^ b = (a .& not b) .| (not a .& b)
 
+-- |Derive instances of BitRepr for algebraic types.
 deriveBitRepr :: [TH.Name] -> TH.Q [TH.Dec]
 deriveBitRepr names = return []
 
@@ -358,18 +389,29 @@ deriveBitRepr names = return []
 $(liftM concat $ forM [2..8] $ \n -> let
 		names = map (TH.mkName . ("a"++) . show) [1..n]
 		types = map TH.VarT names
-		fes = map (TH.ConT (TH.mkName "FE") `TH.AppT`) types
-		matchN = TH.mkName "Match"
-		changeN = TH.mkName "Change"
-		matchC t = TH.ConT (TH.mkName "Match") `TH.AppT` t
-		changeC t = TH.ConT (TH.mkName "Change") `TH.AppT` t
-		tupleC t = TH.ConT (TH.mkName "Tuple") `TH.AppT` t
+		tupleP = TH.TupP (map TH.VarP names)
+		tupleType = tupleT types
+		fes = map (TH.ConT (''FE) `TH.AppT`) types
+		matchN = ''Match
+		changeN = ''Change
+		matchC t = TH.ConT (''Match) `TH.AppT` t
+		changeC t = TH.ConT (''Change) `TH.AppT` t
+		tupleC t = TH.ConT (''Tuple) `TH.AppT` t
+		bitReprC t = TH.ConT (''BitRepr) `TH.AppT` t
 		matchPred t = TH.ClassP matchN [t]
 		changePred t = TH.ClassP changeN [t]
+		bitReprPred t = TH.ClassP ''BitRepr [t]
 		tupleT ts = foldl TH.AppT (TH.TupleT (length ts)) ts
 		tupleFEs = tupleT fes
-		match = TH.InstanceD (map matchPred fes) (matchC tupleFEs) []
+		_matchHeaderCode = TH.FunD '_matchHeader
+			[TH.Clause [tupleP] (TH.NormalB $ TH.DoE stmts) []]
+			where
+				stmts = zipWith (\name ix -> TH.NoBindS $ TH.VarE '_setReady `TH.AppE` TH.VarE name `TH.AppE` TH.LitE (TH.IntegerL ix))
+					names [0..]
+		match = TH.InstanceD (map matchPred fes) (matchC tupleFEs) [_matchHeaderCode]
 		change = TH.InstanceD (map changePred fes) (changeC tupleFEs) []
 		tuple = TH.InstanceD [] (tupleC tupleFEs) []
-	in return [match, change, tuple]
+		bitRepr = TH.InstanceD (TH.ClassP ''Nat [TH.ConT ''BitSize `TH.AppT` tupleType]:map bitReprPred types) (bitReprC tupleType) []
+	in return [match, change, tuple, bitRepr]
  )
+
