@@ -4,7 +4,8 @@
 --
 -- Copyright (C) 2013 Serguey Zefirov.
 
-{-# LANGUAGE TypeOperators, TemplateHaskell #-}
+{-# LANGUAGE TypeOperators, TemplateHaskell, FlexibleContexts #-}
+{-# LANGUAGE TypeFamilies #-}
 
 module Language.Floha.FPrelude where
 
@@ -21,11 +22,13 @@ data EOP = NoEOP | EOP
 
 $(deriveBitRepr [''SOP, ''EOP])
 
+type AS a = (SOP, EOP, a)
+
 -------------------------------------------------------------------------------
 -- Basic actors.
 
 -- |Mapping actor.
-mapA :: (FE a -> FE b) -> Actor (a :. Nil) (b :. Nil)
+mapA :: (BitRepr a, BitRepr b) => (FE a -> FE b) -> Actor (a :. Nil) (b :. Nil)
 mapA f = actorN "map" ("i" :. Nil) $ \(i :. Nil) -> do
 	o <- autoN "o"
 	rules (i --> o)
@@ -33,9 +36,9 @@ mapA f = actorN "map" ("i" :. Nil) $ \(i :. Nil) -> do
 	return (o :. Nil)
 
 -- |Zipping actor.
--- Our streams are infinite, basicaally. So zipping actor will wait for both
+-- Our streams are infinite, basically. So zipping actor will wait for both
 -- values to arrive.
-zipWithA :: (FE a -> FE b -> FE c) -> Actor (a :. b :. Nil) (c :. Nil)
+zipWithA :: (BitRepr a, BitRepr b, BitRepr c) => (FE a -> FE b -> FE c) -> Actor (a :. b :. Nil) (c :. Nil)
 zipWithA f = actorN "zipWith" ("a" :. "b" :. Nil) $ \(a :. b :. Nil) -> do
 	o <- autoN "o"
 	rules ((a, b) --> o)
@@ -45,17 +48,22 @@ zipWithA f = actorN "zipWith" ("a" :. "b" :. Nil) $ \(a :. b :. Nil) -> do
 -- |Folding actor for packetized streams.
 -- It won't work properly if there's data between final EOP and initial SOP.
 -- (but it is not valid Avalon stream anyway)
-foldA :: BitRepr b => b -> (FE a -> FE b -> FE b) -> Actor ((SOP, EOP, a) :. Nil) (b :. Nil)
-foldA b0 foldF = actorN "fold" ("a" :. Nil) $ \(a :. Nil) -> do
+foldA :: (BitRepr b, BitRepr (AS a), BitRepr a) => b -> (FE a -> FE b -> FE b) -> Actor (AS a :. Nil) (b :. Nil)
+foldA b0 foldF = actorN "fold" ("i" :. Nil) $ \(i :. Nil) -> do
 	b <- autoN "b"
+	a <- autoN "a"
 	initial b b0
 	o <- autoN "o"
-	rules ((a, b, foldF b a) --> (b,o))
+	rules ((i, foldF a b) --> (b,o))
 		-- if we encounter EOP, output next value, remember initial b0.
-		[ (tuple (__, feEOP, a), b) --> (constant b0, b)
+		[ (as (__, feEOP, a), b) --> (constant b0, b)
 		-- no EOP, no output.
-		, (tuple (__, __, a), b) --> (b, __)
+		, (as (__, __, a), b) --> (b, __)
 		]
+	return (o :. Nil)
+	where
+		as :: (BitRepr c, FE (SOP,EOP,c) ~ FETuple (FE SOP, FE EOP, FE c)) => (FE SOP, FE EOP, FE c) -> FE (SOP,EOP,c)
+		as (a,b,c) = tuple (a,b,c)
 
 -------------------------------------------------------------------------------
 -- Actors for packetized streams (with SOP and EOP).

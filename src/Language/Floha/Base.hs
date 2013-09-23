@@ -380,8 +380,27 @@ instance Logic Bool where
 	a .^ b = (a .& not b) .| (not a .& b)
 
 -- |Derive instances of BitRepr for algebraic types.
+-- Also derive functions to express construction of algebraic types values as FE's.
 deriveBitRepr :: [TH.Name] -> TH.Q [TH.Dec]
-deriveBitRepr names = return []
+deriveBitRepr names = do
+	defs <- liftM concat $ forM names $ \name -> do
+		info <- TH.reify name
+		case info of
+			TH.TyConI (TH.DataD [] name vars conses derive) -> do
+				fes <- liftM concat $ forM conses $ \cons -> def name vars cons
+				return (bitRepr name vars conses : fes)
+			_ -> error $ show name ++ " is not an algebraic type with empty context."
+	return defs
+	where
+		bitRepr name vars conses = TH.InstanceD [] (TH.ConT ''BitRepr `TH.AppT` TH.ConT name) []
+		def name vars cons = do
+			let funN = TH.mkName $ "fe"++TH.nameBase conN
+			TH.runIO $ putStrLn $ "defining construction for "++show (name, vars, cons)
+			return [TH.FunD funN [TH.Clause [] (TH.NormalB (TH.VarE 'undefined)) []]]
+			where
+				conN = case cons of
+					TH.NormalC n _ -> n
+					_ -> error $ "Only normal constructors are allowed. Problem is "++show cons
 
 -------------------------------------------------------------------------------
 -- Trivial derivable instance for header tuples, BitRepr, etc.
