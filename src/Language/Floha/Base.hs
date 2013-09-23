@@ -136,7 +136,19 @@ data LowFE =
 
 -- |Binary operations for LowFE. Note that there is no distinction between bitwise and logical operations.
 -- This is so because they are identical for Verilog and can be made so for VHDL.
-data LFWBinOp = Plus | Minus | And | Or | Xor
+data LFWBinOp = Plus | Minus | And | Or | Xor | Equal | Compare CompareOp
+	deriving (Eq, Ord, Show)
+
+-- |Whether comparison is signed?
+data Signed = Unsigned | Signed
+	deriving (Eq, Ord, Show)
+
+-- |The comparison operator.
+data CompareOperator = LT | LE | GT | GE
+	deriving (Eq, Ord, Show)
+
+-- |Compare operations.
+data CompareOp = CompareOp CompareOperator Signed
 	deriving (Eq, Ord, Show)
 
 -- |Sized low FE is a pair of LowFE value and it's size.
@@ -384,6 +396,9 @@ instance Logic Bool where
 	(.|) = (||)
 	a .^ b = (a .& not b) .| (not a .& b)
 
+_concatenateSizedBitVectors :: [(NatI, BitVectConst)] -> BitVectConst
+_concatenateSizedBitVectors vects = snd $ foldl1 (\(_,acc) (size, x) -> (0,shiftL acc (fromIntegral $ fromNatI size) .|. x)) vects
+
 -- |Derive instances of BitRepr for algebraic types.
 -- Also derive functions to express construction of algebraic types values as FE's.
 deriveBitRepr :: [TH.Name] -> TH.Q [TH.Dec]
@@ -406,7 +421,7 @@ deriveBitRepr names = do
 		bitRepr name vars conses = TH.InstanceD
 			(TH.ClassP ''Nat [TH.ConT ''BitSize `TH.AppT` ty] : map bitReprC (map fromVarBindr vars))
 			(TH.ConT ''BitRepr `TH.AppT` ty)
-			[ TH.TySynInstD ''BitSize [ty] sizeT]
+			[ TH.TySynInstD ''BitSize [ty] sizeT, safeValueV, encodeF, decodeF]
 			where
 				ty = completeTy name vars
 				nToTy 0 = TH.ConT ''Z
@@ -423,6 +438,14 @@ deriveBitRepr names = do
 				sizeT = case concatMap consSize conses of
 					[] -> selSize
 					s:ss -> plusT selSize (foldl maxT s ss)
+				safeValueV = TH.FunD 'safeValue [TH.Clause [] (TH.NormalB sv) []]
+					where
+						sv = case conses of
+							TH.NormalC name tys : _ -> foldl TH.AppE (TH.ConE name) (map (const $ TH.VarE 'safeValue) tys)
+							_ -> error "not a normal constructor for safe value."
+				x = TH.mkName "x"
+				encodeF = TH.FunD 'encode [TH.Clause [TH.VarP x] (TH.NormalB $ TH.VarE 'undefined) []]
+				decodeF = TH.FunD 'decode [TH.Clause [TH.VarP x] (TH.NormalB $ TH.VarE 'undefined) []]
 		def i n name vars cons = do
 			let funN = TH.mkName $ "fe"++TH.nameBase conN
 			TH.runIO $ putStrLn $ "defining construction for "++show (name, vars, cons)
@@ -452,6 +475,7 @@ $(liftM concat $ forM [2..8] $ \n -> let
 		bitReprPred t = TH.ClassP ''BitRepr [t]
 		tupleT ts = foldl TH.AppT (TH.TupleT (length ts)) ts
 		tupleFEs = tupleT fes
+		feTuple = TH.ConT ''FE `TH.AppT` tupleType
 		_matchHeaderCode = TH.FunD '_matchHeader
 			[TH.Clause [tupleP] (TH.NormalB $ TH.DoE stmts) []]
 			where
@@ -459,9 +483,36 @@ $(liftM concat $ forM [2..8] $ \n -> let
 					names [0..]
 		match = TH.InstanceD (map matchPred fes) (matchC tupleFEs) [_matchHeaderCode]
 		change = TH.InstanceD (map changePred fes) (changeC tupleFEs) []
-		tuple = TH.InstanceD [] (tupleC tupleFEs)
-			[TH.TySynInstD ''FETuple [tupleFEs] (TH.ConT ''FE `TH.AppT` tupleType)]
-		bitRepr = TH.InstanceD (TH.ClassP ''Nat [TH.ConT ''BitSize `TH.AppT` tupleType]:map bitReprPred types) (bitReprC tupleType) []
-	in return [match, change, tuple, bitRepr]
+		tupleNName = TH.mkName $ "tuple"++show n
+		tupleNTy = TH.SigD tupleNName $ TH.ForallT (map TH.PlainTV names) (map bitReprPred types) $ TH.ArrowT `TH.AppT` tupleFEs `TH.AppT` feTuple
+		tupleN = TH.FunD tupleNName [TH.Clause [] (TH.NormalB $ TH.VarE 'tuple) []]
+		x = TH.mkName "x"
+		tuplePFELow = TH.TupP $ map (\n -> TH.ConP 'FELow [TH.VarP n]) names
+		tupleF = TH.FunD 'tuple
+			[TH.Clause [tuplePFELow]
+				(TH.NormalB $ TH.ConE 'FELow `TH.AppE` TH.TupE [sumSize, cat])
+				[] ]
+			where
+				list = TH.ListE (map TH.VarE names)
+				sumSize = TH.VarE 'sum `TH.AppE` (TH.VarE 'map `TH.AppE` TH.VarE 'fst `TH.AppE` list)
+				cat = TH.ConE 'LFECat `TH.AppE` list
+		tupleD = TH.InstanceD [] (tupleC tupleFEs)
+			[ TH.TySynInstD ''FETuple [tupleFEs] feTuple
+			, tupleF
+			]
+		safeValueV = TH.FunD 'safeValue [TH.Clause [] (TH.NormalB $ TH.TupE $ map (const $ TH.VarE 'safeValue) names) []]
+		plusT a b = TH.ConT ''Plus `TH.AppT` a `TH.AppT` b
+		encodeF = TH.FunD 'encode
+			[TH.Clause [tupleP]
+				(TH.NormalB $ TH.VarE '_concatenateSizedBitVectors `TH.AppE`
+					TH.ListE (map (\v -> TH.TupE [TH.VarE 'bitReprSize `TH.AppE` v, TH.VarE 'encode `TH.AppE` v]) $ map TH.VarE names)) []]
+		bitSize t = TH.ConT ''BitSize `TH.AppT` t
+		bitReprD = TH.InstanceD (TH.ClassP ''Nat [bitSize tupleType]:map bitReprPred types) (bitReprC tupleType)
+			[ encodeF
+			, TH.FunD 'decode [TH.Clause [TH.VarP x] (TH.NormalB $ TH.VarE 'undefined) []]
+			, safeValueV
+			, TH.TySynInstD ''BitSize [tupleType] $ foldl plusT (bitSize $ head types) (map bitSize $ tail types)
+			]
+	in return [match, change, tupleD, bitReprD, tupleNTy, tupleN]
  )
 
