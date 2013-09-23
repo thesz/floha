@@ -60,6 +60,11 @@ type family Plus a b
 type instance Plus Z b = b
 type instance Plus (S a) b = S (Plus a b)
 
+type family Max a b
+type instance Max Z (S b) = S b
+type instance Max (S a) Z = S a
+type instance Max (S a) (S b) = S (Max a b)
+
 newtype NatI = NatI { fromNatI :: Integer}
 	deriving (Eq, Ord, Show, Num)
 
@@ -387,13 +392,38 @@ deriveBitRepr names = do
 		info <- TH.reify name
 		case info of
 			TH.TyConI (TH.DataD [] name vars conses derive) -> do
-				fes <- liftM concat $ forM conses $ \cons -> def name vars cons
+				fes <- liftM concat $ forM (zip [0..] conses) $ \(i, cons) -> def i (length conses) name vars cons
 				return (bitRepr name vars conses : fes)
 			_ -> error $ show name ++ " is not an algebraic type with empty context."
+	TH.runIO $ mapM (print . TH.ppr) defs
 	return defs
 	where
-		bitRepr name vars conses = TH.InstanceD [] (TH.ConT ''BitRepr `TH.AppT` TH.ConT name) []
-		def name vars cons = do
+		completeTy name vars =
+			foldl TH.AppT (TH.ConT name) $ map (TH.VarT . fromVarBindr) vars
+		fromVarBindr (TH.PlainTV v) = v
+		fromVarBindr (TH.KindedTV _ _) = error "kinded type arguments aren't supported."
+		bitReprC v = TH.ClassP ''BitRepr [TH.VarT v]
+		bitRepr name vars conses = TH.InstanceD
+			(TH.ClassP ''Nat [TH.ConT ''BitSize `TH.AppT` ty] : map bitReprC (map fromVarBindr vars))
+			(TH.ConT ''BitRepr `TH.AppT` ty)
+			[ TH.TySynInstD ''BitSize [ty] sizeT]
+			where
+				ty = completeTy name vars
+				nToTy 0 = TH.ConT ''Z
+				nToTy n = TH.ConT ''S `TH.AppT` nToTy (n-1)
+				selSize
+					| length conses == 1 = nToTy 0
+					| length conses == 2 = nToTy 1
+					| length conses > 2 = nToTy (length conses)
+				plusT a b = TH.ConT ''Plus `TH.AppT` a `TH.AppT` b
+				maxT a b = TH.ConT ''Max `TH.AppT` a `TH.AppT` b
+				bitSizeT a = TH.ConT ''BitSize `TH.AppT` a
+				consSize (TH.NormalC _ []) = []
+				consSize (TH.NormalC _ (a:as)) = [foldl plusT (bitSizeT $ snd a) (map (bitSizeT . snd) as)]
+				sizeT = case concatMap consSize conses of
+					[] -> selSize
+					s:ss -> plusT selSize (foldl maxT s ss)
+		def i n name vars cons = do
 			let funN = TH.mkName $ "fe"++TH.nameBase conN
 			TH.runIO $ putStrLn $ "defining construction for "++show (name, vars, cons)
 			return [TH.FunD funN [TH.Clause [] (TH.NormalB (TH.VarE 'undefined)) []]]
@@ -429,7 +459,8 @@ $(liftM concat $ forM [2..8] $ \n -> let
 					names [0..]
 		match = TH.InstanceD (map matchPred fes) (matchC tupleFEs) [_matchHeaderCode]
 		change = TH.InstanceD (map changePred fes) (changeC tupleFEs) []
-		tuple = TH.InstanceD [] (tupleC tupleFEs) []
+		tuple = TH.InstanceD [] (tupleC tupleFEs)
+			[TH.TySynInstD ''FETuple [tupleFEs] (TH.ConT ''FE `TH.AppT` tupleType)]
 		bitRepr = TH.InstanceD (TH.ClassP ''Nat [TH.ConT ''BitSize `TH.AppT` tupleType]:map bitReprPred types) (bitReprC tupleType) []
 	in return [match, change, tuple, bitRepr]
  )

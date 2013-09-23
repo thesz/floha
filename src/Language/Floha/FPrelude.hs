@@ -5,7 +5,7 @@
 -- Copyright (C) 2013 Serguey Zefirov.
 
 {-# LANGUAGE TypeOperators, TemplateHaskell, FlexibleContexts #-}
-{-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE TypeFamilies, UndecidableInstances #-}
 
 module Language.Floha.FPrelude where
 
