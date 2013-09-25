@@ -42,6 +42,8 @@ import qualified Data.Set as Set
 
 import qualified Language.Haskell.TH as TH
 
+import Debug.Trace
+
 -------------------------------------------------------------------------------
 -- HList.
 
@@ -132,6 +134,7 @@ data LowFE =
 	|	LFEReady	(Maybe VarID)
 	|	LFEBin		LFWBinOp	SizedLFE	SizedLFE
 	|	LFECat		[SizedLFE]
+	|	LFEChangeSize	ChangeFiller	(SizedLFE)
 	deriving (Eq, Ord, Show)
 
 -- |Binary operations for LowFE. Note that there is no distinction between bitwise and logical operations.
@@ -149,6 +152,11 @@ data CompareOperator = LT | LE | GT | GE
 
 -- |Compare operations.
 data CompareOp = CompareOp CompareOperator Signed
+	deriving (Eq, Ord, Show)
+
+-- |What we are doing when changing size of expression.
+-- This is relevant only for extending the size.
+data ChangeFiller = FillZero | FillSign
 	deriving (Eq, Ord, Show)
 
 -- |Sized low FE is a pair of LowFE value and it's size.
@@ -251,6 +259,11 @@ initial :: BitRepr a => FE a -> a -> ActorBodyM ()
 initial (FELow (_,LFEVar vid)) a = do
 	_setInitial vid (bitReprSize a, LFEConst (encode a))
 
+internalUnsafeCast :: (BitRepr a, BitRepr b) => FE a -> FE b
+internalUnsafeCast (FELow e) = r
+	where
+		r = FELow (feBitSize r, LFEChangeSize FillZero e)
+
 -------------------------------------------------------------------------------
 -- Implementation.
 
@@ -270,6 +283,17 @@ data ABState = ABS {
 type ActorBodyM a = State ABState a
 
 type ActorBody ins outs = ins -> ActorBodyM outs
+
+-- |Handy function to get the size of FE.
+feBitSize :: BitRepr a => FE a -> NatI
+feBitSize e = bitReprSize $ toA e
+	where
+		toA :: BitRepr a => FE a -> a
+		toA _ = error "toA in feBitSize called!"
+
+-- |Handy function to get the safe value for FE.
+feSafeValue :: BitRepr a => FE a -> a
+feSafeValue e = safeValue
 
 startABState :: ABState
 startABState = ABS {
@@ -300,10 +324,8 @@ inventVar name = do
 		mkR varID = (r, initial)
 			where
 				r = FELow (size, LFEVar varID)
-				toA :: BitRepr a => FE a -> a
-				toA _ = error "toA was forced!"
-				size = fromIntegral $ fromNatI $ bitReprSize $ toA r
-				initial = (size, LFEConst $ encode $ safeValue `asTypeOf` toA r)
+				size = feBitSize r
+				initial = (size, LFEConst $ encode $ feSafeValue r)
 
 _setReady :: FE a -> Int -> ActorBodyM ()
 _setReady (FELow lfe) n = do
@@ -399,6 +421,8 @@ instance Logic Bool where
 _concatenateSizedBitVectors :: [(NatI, BitVectConst)] -> BitVectConst
 _concatenateSizedBitVectors vects = snd $ foldl1 (\(_,acc) (size, x) -> (0,shiftL acc (fromIntegral $ fromNatI size) .|. x)) vects
 
+type family AlgebraicTypeBusSize a
+
 -- |Derive instances of BitRepr for algebraic types.
 -- Also derive functions to express construction of algebraic types values as FE's.
 deriveBitRepr :: [TH.Name] -> TH.Q [TH.Dec]
@@ -407,8 +431,8 @@ deriveBitRepr names = do
 		info <- TH.reify name
 		case info of
 			TH.TyConI (TH.DataD [] name vars conses derive) -> do
-				fes <- liftM concat $ forM (zip [0..] conses) $ \(i, cons) -> def i (length conses) name vars cons
-				return (bitRepr name vars conses : fes)
+				fes <- liftM concat $ forM (zip [0..] conses) $ \(i, cons) -> def i (length conses) (maximum $ map (length . conTypes) conses) name vars cons
+				return (bitRepr name vars conses ++ fes)
 			_ -> error $ show name ++ " is not an algebraic type with empty context."
 	TH.runIO $ mapM (print . TH.ppr) defs
 	return defs
@@ -417,15 +441,23 @@ deriveBitRepr names = do
 			foldl TH.AppT (TH.ConT name) $ map (TH.VarT . fromVarBindr) vars
 		fromVarBindr (TH.PlainTV v) = v
 		fromVarBindr (TH.KindedTV _ _) = error "kinded type arguments aren't supported."
+		conTypes cons = case cons of
+			TH.NormalC _ stys -> map snd stys
 		bitReprC v = TH.ClassP ''BitRepr [TH.VarT v]
-		bitRepr name vars conses = TH.InstanceD
-			(TH.ClassP ''Nat [TH.ConT ''BitSize `TH.AppT` ty] : map bitReprC (map fromVarBindr vars))
-			(TH.ConT ''BitRepr `TH.AppT` ty)
-			[ TH.TySynInstD ''BitSize [ty] sizeT, safeValueV, encodeF, decodeF]
+		bitRepr name vars conses =
+			[ TH.InstanceD
+				(TH.ClassP ''Nat [TH.ConT ''BitSize `TH.AppT` ty] : map bitReprC (map fromVarBindr vars))
+				(TH.ConT ''BitRepr `TH.AppT` ty)
+				[ TH.TySynInstD ''BitSize [ty] sizeT, safeValueV, encodeF, decodeF]
+			, TH.TySynInstD ''AlgebraicTypeBusSize [ty] (plusT selSize (foldl1 maxT conSizes))]
 			where
 				ty = completeTy name vars
 				nToTy 0 = TH.ConT ''Z
 				nToTy n = TH.ConT ''S `TH.AppT` nToTy (n-1)
+				conSizes = map conSize conses
+				conSize cons = case conTypes cons of
+					[] -> TH.ConT ''Z
+					ts -> foldl1 plusT $ map (TH.ConT ''BitSize `TH.AppT`) ts
 				selSize
 					| length conses == 1 = nToTy 0
 					| length conses == 2 = nToTy 1
@@ -446,14 +478,21 @@ deriveBitRepr names = do
 				x = TH.mkName "x"
 				encodeF = TH.FunD 'encode [TH.Clause [TH.VarP x] (TH.NormalB $ TH.VarE 'undefined) []]
 				decodeF = TH.FunD 'decode [TH.Clause [TH.VarP x] (TH.NormalB $ TH.VarE 'undefined) []]
-		def i n name vars cons = do
+		def i n maxTys name vars cons = do
 			let funN = TH.mkName $ "fe"++TH.nameBase conN
 			TH.runIO $ putStrLn $ "defining construction for "++show (name, vars, cons)
-			return [TH.FunD funN [TH.Clause [] (TH.NormalB (TH.VarE 'undefined)) []]]
+			case (n, maxTys) of
+				-- special cases for enums, they are easy.
+				(1,0) -> return [TH.FunD funN [TH.Clause [] (TH.NormalB $ feLow $ constSizedLTE 0 (constLTE 0)) []]]
+				(2,0) -> return [TH.FunD funN [TH.Clause [] (TH.NormalB $ feLow $ constSizedLTE 1 (constLTE i)) []]]
+				(n,0) -> return [TH.FunD funN [TH.Clause [] (TH.NormalB $ feLow $ constSizedLTE n (constLTE (shiftL (1 :: Int) i))) []]]
 			where
+				feLow e = TH.ConE 'FELow `TH.AppE` e
+				constLTE c = TH.ConE 'LFEConst `TH.AppE` TH.LitE (TH.IntegerL $ fromIntegral c)
+				constSizedLTE size e = TH.TupE [TH.LitE $ TH.IntegerL $ fromIntegral size, e]
 				conN = case cons of
 					TH.NormalC n _ -> n
-					_ -> error $ "Only normal constructors are allowed. Problem is "++show cons
+					_ -> error $ "Only normal constructors are allowed. Problem is "++show (TH.ppr cons)
 
 -------------------------------------------------------------------------------
 -- Trivial derivable instance for header tuples, BitRepr, etc.
@@ -506,6 +545,12 @@ $(liftM concat $ forM [2..8] $ \n -> let
 			[TH.Clause [tupleP]
 				(TH.NormalB $ TH.VarE '_concatenateSizedBitVectors `TH.AppE`
 					TH.ListE (map (\v -> TH.TupE [TH.VarE 'bitReprSize `TH.AppE` v, TH.VarE 'encode `TH.AppE` v]) $ map TH.VarE names)) []]
+		decodeF = TH.FunD 'encode [TH.Clause [TH.VarP x] (TH.NormalB $ TH.VarE r) [rD, ssD]]
+			where
+				ssD = TH.ValD (TH.VarP ss) (TH.NormalB $ TH.ListE $ map (\n -> TH.VarE 'bitReprSize `TH.AppE` TH.VarE n) names) []
+				ss = TH.mkName "ss"
+				rD = TH.ValD (TH.AsP r tupleP) (TH.NormalB $ TH.VarE 'undefined) []
+				r = TH.mkName "r"
 		bitSize t = TH.ConT ''BitSize `TH.AppT` t
 		bitReprD = TH.InstanceD (TH.ClassP ''Nat [bitSize tupleType]:map bitReprPred types) (bitReprC tupleType)
 			[ encodeF
@@ -513,6 +558,9 @@ $(liftM concat $ forM [2..8] $ \n -> let
 			, safeValueV
 			, TH.TySynInstD ''BitSize [tupleType] $ foldl plusT (bitSize $ head types) (map bitSize $ tail types)
 			]
-	in return [match, change, tupleD, bitReprD, tupleNTy, tupleN]
+	in do
+		let rs = [match, change, tupleD, bitReprD, tupleNTy, tupleN]
+		when (n == 3) $ TH.runIO $ mapM_ (print . TH.ppr) rs
+		return rs
  )
 
