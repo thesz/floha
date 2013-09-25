@@ -27,6 +27,32 @@ type AS a = (SOP, EOP, a)
 -------------------------------------------------------------------------------
 -- Basic actors.
 
+-- |Identity actor. While simple, it can be useful in some situations.
+idA :: BitRepr a => Actor (a :. Nil) (a :. Nil)
+idA = actorN "id" ("a" :. Nil) $ \(i :. Nil) -> do
+	o <- autoN "o"
+	rules (i --> o)
+		[ i --> o]
+	return (o :. Nil)
+
+-- |Nil actor - accepts anything, produces nothing.
+nilA :: BitRepr a => Actor (a :. Nil) Nil
+nilA = actorN "nil" ("i" :. Nil) $ \(i :. Nil) -> do
+	-- this variable will be optimized away.
+	x <- autoN "x"
+	rules (i --> (x :: FE ()))
+		[i --> x]
+	return Nil
+
+-- |Duplication of stream.
+dupA :: BitRepr a => Actor (a :. Nil) (a :. a :. Nil) 
+dupA = actorN "dup" ("i" :. Nil) $ \(i :. Nil) -> do
+	left <- autoN "left"
+	right <- autoN "right"
+	rules (i --> (left, right))
+		[(i --> (i,i))]
+	return (left :. right :. Nil)
+
 -- |Mapping actor.
 mapA :: (BitRepr a, BitRepr b) => (FE a -> FE b) -> Actor (a :. Nil) (b :. Nil)
 mapA f = actorN "map" ("i" :. Nil) $ \(i :. Nil) -> do

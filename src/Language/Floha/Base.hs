@@ -413,10 +413,19 @@ instance BitRepr Bool where
 	encode = BitVectConst . fromIntegral . fromEnum
 	decode = toEnum . fromIntegral . fromBitVectConst
 
+instance BitRepr () where
+	type BitSize () = Z
+	safeValue = ()
+	encode = const 0
+	decode = const ()
+
 instance Logic Bool where
 	(.&) = (&&)
 	(.|) = (||)
 	a .^ b = (a .& not b) .| (not a .& b)
+
+-------------------------------------------------------------------------------
+-- Derivation of BitRepr for algebraic types.
 
 _concatenateSizedBitVectors :: [(NatI, BitVectConst)] -> BitVectConst
 _concatenateSizedBitVectors vects = snd $ foldl1 (\(_,acc) (size, x) -> (0,shiftL acc (fromIntegral $ fromNatI size) .|. x)) vects
