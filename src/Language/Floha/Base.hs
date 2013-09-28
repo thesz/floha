@@ -29,6 +29,9 @@ module Language.Floha.Base
 	, Logic(..)
 	, AddSub(..)
 	, net
+	, feFalse
+	, feTrue
+	, feUnit
 	, deriveBitRepr
 	) where
 
@@ -405,19 +408,45 @@ instance Change (FE a) where
 	_change e = return $ constant False
 
 -------------------------------------------------------------------------------
+-- Code generation.
+
+-- |What language we should generate for.
+data Language = VHDL | Verilog
+	deriving (Eq, Ord, Show)
+
+-- |Result of code generation.
+data Generated = Generated {
+	  genTopLevel		:: String
+	, genText		:: String
+	}
+
+-- |Generate code from actor (either just an actor or network).
+generateCode :: Language -> Actor ins outs -> Generated
+generateCode lang actor = error "generateCode"
+
+-------------------------------------------------------------------------------
 -- Instances of various classes for various types.
 
 instance BitRepr Bool where
 	type BitSize Bool = S Z
 	safeValue = False
-	encode = BitVectConst . fromIntegral . fromEnum
+	encode = fromInteger . fromIntegral . fromEnum
 	decode = toEnum . fromIntegral . fromBitVectConst
+
+feFalse :: FE Bool
+feFalse = FELow (1, LFEConst 0)
+
+feTrue :: FE Bool
+feTrue = FELow (1, LFEConst 1)
 
 instance BitRepr () where
 	type BitSize () = Z
 	safeValue = ()
 	encode = const 0
 	decode = const ()
+
+feUnit :: FE ()
+feUnit = FELow (0, LFEConst 0)
 
 instance Logic Bool where
 	(.&) = (&&)

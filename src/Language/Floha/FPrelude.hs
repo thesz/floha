@@ -71,6 +71,9 @@ zipWithA f = actorN "zipWith" ("a" :. "b" :. Nil) $ \(a :. b :. Nil) -> do
 		[ (a,b) --> f a b]
 	return (o :. Nil)
 
+-------------------------------------------------------------------------------
+-- Actors for packetized streams (with SOP and EOP).
+
 -- |Folding actor for packetized streams.
 -- It won't work properly if there's data between final EOP and initial SOP.
 -- (but it is not valid Avalon stream anyway)
@@ -80,17 +83,31 @@ foldA b0 foldF = actorN "fold" ("i" :. Nil) $ \(i :. Nil) -> do
 	a <- autoN "a"
 	initial b b0
 	o <- autoN "o"
-	rules ((i, foldF a b) --> (b,o))
+	rules ((i, b) --> (b,o))
 		-- if we encounter EOP, output next value, remember initial b0.
-		[ (as (__, feEOP, a), b) --> (constant b0, b)
+		[ (as (__, feEOP, a), b) --> (constant b0, foldF a b)
 		-- no EOP, no output.
-		, (as (__, __, a), b) --> (b, __)
+		, (as (__, __,    a), b) --> (foldF a b,   __)
 		]
 	return (o :. Nil)
 	where
 		as :: (BitRepr c, FE (SOP,EOP,c) ~ FETuple (FE SOP, FE EOP, FE c)) => (FE SOP, FE EOP, FE c) -> FE (SOP,EOP,c)
 		as (a,b,c) = tuple (a,b,c)
 
--------------------------------------------------------------------------------
--- Actors for packetized streams (with SOP and EOP).
+-- |Make an arbitrage between two Avalon streams. Send one completely to the output.
+-- Arbitrage is made for fair transmission - if left stream was transmitted, then
+-- right stream gets prority, and vice versa.
+arbiterA :: (BitRepr a) => Actor (AS a :. AS a :. Nil) (AS a :. Nil)
+arbiterA = actorN "arbiter" ("left" :. "right" :. Nil) $ \(left :. right :. Nil) -> do
+	o <- autoN "out"
+	lastLeft <- autoN "lastLeft"
+	initial lastLeft False
+	transmit <- autoN "transmit"
+	a <- autoN "a"
+	rules ((transmit, lastLeft, left, right) --> (transmit, lastLeft, o))
+		[ (feFalse, feFalse,  tuple (feSOP, feEOP,   a), __) -->   (feFalse, feTrue, tuple (feSOP, feEOP,   a))
+		, (feFalse, feFalse,  tuple (feSOP, feNoEOP, a), __) -->   (feTrue,  feTrue, tuple (feSOP, feNoEOP, a))
+		, (feTrue,  lastLeft, tuple (feNoSOP, feNoEOP, a), __) --> (feTrue,  lastLeft, tuple (feNoSOP, feNoEOP, a))
+		]
+	return (o :. Nil)
 
