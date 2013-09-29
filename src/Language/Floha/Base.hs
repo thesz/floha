@@ -16,6 +16,8 @@ module Language.Floha.Base
 	, (-->)
 	, LiftFE
 	, Tuple(..)
+	, Reset(..)
+	, Clock(..)
 	, Actor(..)
 	, actor
 	, actorN
@@ -26,6 +28,8 @@ module Language.Floha.Base
 	, __
 	, rules
 	, constant
+	, report
+	, simulate
 	, Logic(..)
 	, AddSub(..)
 	, net
@@ -195,6 +199,7 @@ type family StringList ts
 type instance StringList Nil = Nil
 type instance StringList (n :. ns) = String :. StringList ns
 
+-- |Tuple support.
 class Tuple tup where
 	-- |Transformation at type level - from (FE a, FE b) to FE (a,b)
 	type FETuple tup
@@ -202,11 +207,37 @@ class Tuple tup where
 	-- |The code for transformation.
 	tuple :: tup -> FETuple tup
 
+-- |Reset signal properties.
+class Reset r where
+	-- |Name of reset signal.
+	resetName :: r -> String
+
+	-- |Reset active polarity, True for positive (1).
+	resetPosActive :: r -> Bool
+
+	-- |Is reset synchronous?
+	resetSynchronous :: r -> Bool
+
+class Reset (ClockReset c) => Clock c where
+	-- |The type of clock reset signal.
+	type ClockReset c
+
+	-- |The clock name.
+	clockName :: c -> String
+
+	-- |Whether clock edge is positive (front).
+	clockPosEdge :: c -> Bool
+
+	-- |Reset type for this clock.
+	clockReset :: c -> ClockReset c
+
+	-- |Clock frequency.
+	clockFrequency :: c -> Rational
 
 -- |Floha actor.
 data Actor ins outs where
 	-- |Actor is either real actor - a state machine.
-	Actor :: String -> LiftFE ins -> LiftFE outs -> Actor ins outs
+	Actor :: String -> [SizedLFE] -> [SizedLFE] -> Actor ins outs
 	-- |Or actor is a network of connections between actors.
 	Network :: String -> Actor ins outs
 
@@ -214,16 +245,10 @@ data Actor ins outs where
 -- Main combinators.
 
 actor :: (FEList (LiftFE ins), FEList (LiftFE outs)) => String -> ActorBody (LiftFE ins) (LiftFE outs) -> Actor ins outs
-actor name body = flip evalState startABState $ do
-	ins <- inventList Nothing
-	outs <- body ins
-	return $ Actor name ins outs
+actor name body = _mkActor name Nothing body
 
 actorN :: (FEList (LiftFE ins), FEList (LiftFE outs)) => String -> StringList (LiftFE ins) -> ActorBody (LiftFE ins) (LiftFE outs) -> Actor ins outs
-actorN name names body = flip evalState startABState $ do
-	ins <- inventList $ Just names
-	outs <- body ins
-	return $ Actor name ins outs
+actorN name names body = _mkActor name (Just names) body
 
 net :: String -> Actor ins outs
 net name = error "net is not yet ready."
@@ -266,6 +291,11 @@ internalUnsafeCast :: (BitRepr a, BitRepr b) => FE a -> FE b
 internalUnsafeCast (FELow e) = r
 	where
 		r = FELow (feBitSize r, LFEChangeSize FillZero e)
+
+-- |Display the value, if condition is met.
+report :: (BitRepr a, Show a) => FE Bool -> FE a -> ActorBodyM ()
+report condition value = do
+	error "report !!!"
 
 -------------------------------------------------------------------------------
 -- Implementation.
@@ -342,9 +372,11 @@ _setReady (FELow lfe) n = do
 
 class FEList feList where
 	inventList :: Maybe (StringList feList) -> ActorBodyM feList
+	_toSizedLFEs :: feList -> [SizedLFE]
 
 instance FEList Nil where
 	inventList _ = return Nil
+	_toSizedLFEs = const []
 
 instance (BitRepr a, FEList feList) => FEList (FE a :. feList) where
 	inventList names = do
@@ -355,6 +387,7 @@ instance (BitRepr a, FEList feList) => FEList (FE a :. feList) where
 			(name, names') = case names of
 				Just (n :. ns) -> (Just n, Just ns)
 				Nothing -> (Nothing, Nothing)
+	_toSizedLFEs (FELow slfe :. list) = slfe : _toSizedLFEs list
 
 
 class Match match where
@@ -407,6 +440,32 @@ instance Change (FE a) where
 				_ -> lfe
 	_change e = return $ constant False
 
+_mkActor :: (FEList (LiftFE ins), FEList (LiftFE outs)) => String -> Maybe (StringList (LiftFE ins)) -> ActorBody (LiftFE ins) (LiftFE outs) -> Actor ins outs
+_mkActor name names body = flip evalState startABState $ do
+	ins <- inventList names
+	outs <- body ins
+	let outsVars = map checkVar $ _toSizedLFEs outs
+	return $ Actor name (_toSizedLFEs ins) outsVars
+	where
+		checkVar (sz,LFEVar n) = (sz,LFEVar n)
+		checkVar e = error $ "Actor "++show name++": output is not a variable: "++show e
+
+-------------------------------------------------------------------------------
+-- Simulate actors.
+
+-- |Describe input sequences.
+data Sequence a = Wait Int | Data [a]
+	deriving (Eq, Ord, Show)
+
+-- |Transform HList of types into a HList of lists of sequences of types.
+type family SeqsList ins
+type instance SeqsList Nil = Nil
+type instance SeqsList (a :. as) = [Sequence a] :. SeqsList as
+
+-- |Simulate the actor.
+simulate :: Actor ins outs -> SeqsList ins -> SeqsList outs
+simulate actor seqlist = error "simulate!!!"
+
 -------------------------------------------------------------------------------
 -- Code generation.
 
@@ -415,13 +474,13 @@ data Language = VHDL | Verilog
 	deriving (Eq, Ord, Show)
 
 -- |Result of code generation.
-data Generated = Generated {
+data GeneratedCode = GCode {
 	  genTopLevel		:: String
 	, genText		:: String
 	}
 
 -- |Generate code from actor (either just an actor or network).
-generateCode :: Language -> Actor ins outs -> Generated
+generateCode :: Language -> Actor ins outs -> GeneratedCode
 generateCode lang actor = error "generateCode"
 
 -------------------------------------------------------------------------------
