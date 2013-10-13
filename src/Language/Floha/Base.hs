@@ -135,13 +135,27 @@ data FE a where
 -- |Untyped and sized expressions for generating Verilog or VHDL code.
 -- Every expression is accompanied by its size.
 data LowFE =
+	-- regular constant.
 		LFEConst	BitVectConst
+	-- variable - input, output, register, temp...
 	|	LFEVar		VarID
+	-- wildarg. Can be pattern and value.
 	|	LFEWild
-	|	LFEReady	(Maybe VarID)
+	-- "ready" signal from output. Means that output will take the value.
+	|	LFEReady	VarID
+	-- "valid" signal from input. Means that value is valid, e.g., the computation with this value will be valid too.
+	|	LFEValid	VarID
+	-- Various binary operations.
 	|	LFEBin		LFWBinOp	SizedLFE	SizedLFE
+	-- Concatenation of expressions, basically curly brackets from Verilog.
 	|	LFECat		[SizedLFE]
+	-- LFESub value high low: take subvector (low..high) from value. Tuple splits use this. Indices are inclusive.
+	-- The size should be high-low+1.
+	|	LFESub		SizedLFE	Int	Int
+	-- Change size from one to another. Change to smaller size basically is the same as LFESub v (size-1) 0.
 	|	LFEChangeSize	ChangeFiller	(SizedLFE)
+	-- The register assignment. Arguments are name of the clock, default value (after reset) and the computed value.
+	|	LFERegister	String	BitVectConst	SizedLFE
 	deriving (Eq, Ord, Show)
 
 -- |Binary operations for LowFE. Note that there is no distinction between bitwise and logical operations.
@@ -234,10 +248,14 @@ class Reset (ClockReset c) => Clock c where
 	-- |Clock frequency.
 	clockFrequency :: c -> Rational
 
+data Rules = Rules [SizedLFE] [SizedLFE] [([SizedLFE], [SizedLFE])]
+	deriving (Eq, Ord, Show)
+
 -- |Floha actor.
 data Actor ins outs where
 	-- |Actor is either real actor - a state machine.
-	Actor :: String -> [SizedLFE] -> [SizedLFE] -> Actor ins outs
+	-- Name of the actor, inputs, outputs, rules (there can be several rules sections) and clock information.
+	Actor :: Clock c => String -> [SizedLFE] -> [SizedLFE] -> [Rules] -> Maybe c -> Actor ins outs
 	-- |Or actor is a network of connections between actors.
 	Network :: String -> Actor ins outs
 
@@ -255,9 +273,9 @@ net name = error "net is not yet ready."
 
 rules :: (Match matchE, Change changeE) => (matchE, changeE) -> [(matchE, changeE)] -> ActorBodyM ()
 rules (headerMatch, headerResults) matchChanges = do
-	_matchHeader headerMatch
-	_changeHeader headerResults
-	error "rules not yet done!"
+	let r = Rules (matchExpressions headerMatch) (changeExpressions headerResults)
+		(map (\(m,c) -> (matchExpressions m, changeExpressions c)) matchChanges)
+	modify $ \abs -> abs { absRules = r : absRules abs }
 
 -- | @-->@ is just an operator version of tuple constructor.
 infix 9 -->
@@ -305,12 +323,12 @@ data ABState = ABS {
 	  absUnique		:: Int
 	-- |Initial values for the variables.
 	, absInitials		:: Map.Map VarID SizedLFE
-	-- |Ready signals for match header tuple element positions.
-	, absMatchReady		:: Map.Map Int SizedLFE
 	-- |Register signals as inputs.
-	, absInputs		:: Set.Set SizedLFE
+	, absInputs		:: [SizedLFE]
 	-- |And also register signals as outputs.
-	, absOutputs		:: Set.Set SizedLFE
+	, absOutputs		:: [SizedLFE]
+	-- |Rules.
+	, absRules		:: [Rules]
 	}
 
 type ActorBodyM a = State ABState a
@@ -332,9 +350,9 @@ startABState :: ABState
 startABState = ABS {
 	  absUnique		= 0
 	, absInitials		= Map.empty
-	, absMatchReady		= Map.empty
-	, absInputs		= Set.empty
-	, absOutputs		= Set.empty
+	, absInputs		= []
+	, absOutputs		= []
+	, absRules		= []
 	}
 
 _unique :: ActorBodyM Int
@@ -360,16 +378,6 @@ inventVar name = do
 				size = feBitSize r
 				initial = (size, LFEConst $ encode $ feSafeValue r)
 
-_setReady :: FE a -> Int -> ActorBodyM ()
-_setReady (FELow lfe) n = do
-	r <- computeReady lfe
-	modify $ \abs -> abs { absMatchReady = Map.insert n r $ absMatchReady abs }
-	where
-		computeReady (_, LFEVar v) = return (1,LFEReady $ Just v)
-		computeReady (_, LFEBin _ a b) =
-			liftM2 (\a b -> (1, LFEBin And a b)) (computeReady a) (computeReady b)
-		computeReady e = error $ "internal: compute ready does not handle "++show e
-
 class FEList feList where
 	inventList :: Maybe (StringList feList) -> ActorBodyM feList
 	_toSizedLFEs :: feList -> [SizedLFE]
@@ -391,62 +399,86 @@ instance (BitRepr a, FEList feList) => FEList (FE a :. feList) where
 
 
 class Match match where
-	-- |Check that header is OK.
-	_matchHeader :: match -> ActorBodyM ()
-	-- |Compute the readyness signal from match expression and readyness of the corresponding header expression.
-	-- Bind matched variables. Rename variables if needed.
-	_matchReady :: match -> ActorBodyM (FE Bool, Map.Map VarID VarID)
+	-- |Convert the match into the list of expressions.
+	matchExpressions :: match -> [SizedLFE]
 
 class Change change where
-	-- |Check header of the right hand of @rules@. Should be a variable, nothing else, because we assign there.
-	_changeHeader :: change -> ActorBodyM ()
-	-- |Rename bound variables.
-	_changeRename :: Map.Map VarID VarID -> change -> change
-	-- |Perform the computation. Return the "ready" flag.
-	_change :: change -> ActorBodyM (FE Bool)
+	-- |Convert the change part into the list of expressions.
+	changeExpressions :: change -> [SizedLFE]
+
+encodeConst :: BitRepr a => a -> SizedLFE
+encodeConst a = (bitReprSize a, LFEConst $ encode a)
+
+internal :: String -> a
+internal s = error $ "internal error: "++s
+
+lfeTrue, lfeFalse :: SizedLFE
+[lfeTrue, lfeFalse] = map encodeConst [True, False]
+
+lfeReady, lfeValid :: VarID -> SizedLFE
+lfeReady vid = (1, LFEReady vid)
+lfeValid vid = (1, LFEValid vid)
+
+lfeEqual, lfeAnd :: SizedLFE -> SizedLFE -> SizedLFE
+lfeEqual a@(s, _) b = (s, LFEBin Equal a b)
+lfeAnd a b = (fst a, LFEBin And a b)
+
+{-
+addAssignment :: VarID -> SizedLFE -> ActorBodyM ()
+addAssignment vid e = do
+	asgns <- liftM absAssignments get
+	when (vid `elem` map fst asgns) $ internal $ "duplicate assignment "++show vid
+	modify $ \abs -> abs { absAssignments = (vid,e) : absAssignments abs }
+
+-- |Add match assignments to the list of assignments of actor's body.
+-- First argument is an input, second one is match pattern.
+-- Returns:
+--  - "valid" signal to indicate that data present is valid,
+--  - "matched" signal to indicate that match is successful and
+--  - "ready" signal to indicate readiness to take value from the input.
+-- The input can be only variable.
+addMatchAssignments :: SizedLFE -> SizedLFE -> ActorBodyM (SizedLFE, SizedLFE, SizedLFE)
+addMatchAssignments ei@(n1,LFEVar inputVar) slfe@(n2,_)
+	| n1 /= n2 = error "internal error: different sizes in addMatchAssignments!"
+	| otherwise = do
+		genAsgns inputVar ei slfe
+	where
+		inputValid = lfeValid inputVar
+		inputReady = lfeReady inputVar
+		genAsgns _ (_,LFEWild) = do
+			return (lfeTrue, lfeTrue, lfeFalse)
+		genAsgns e (_,LFEVar vid) = do
+			addAssignment vid e
+			return (lfe, lfeTrue, lfeReady inputVar)
+		genAsgns e p@(sz, LFEConst c) = do
+			return (inputValid, lfeEqual e p, lfeReady inputVar)
+		genAsgns e p@(sz, LFECat slfes) = do
+			let accSizes = scanr (+) 0 $ map fst slfes
+			let lows = tail accSizes
+			let highs = map (flip (-) 1) $ init accSizes
+			results <- forM (zip3 slfes $ \(high, low, p@(sz,_)) -> do
+				vid <- _inventVarID Nothing
+				addAssignment vid $ (sz,LFESub high low e)
+				genAsgns inputValid (sz, LFEVar vid) p
+			return (inputValid, foldl1 lfeAnd (map (\(a,b,c) -> b) results), 
+addMatchAssignments _ _ = error "internal error: input is not a variable at addMatchAssignments!"
+-}
 
 instance Match (FE a) where
-	_matchHeader (FELow (size,lfe)) = matchLFE lfe
-		where
-			matchLFE lfe = case lfe of
-				LFEConst a -> error "constant in the left side of rule header."
-				LFEVar v -> return ()
-				LFEWild -> error "wildcard in the left side of rule header."
-				LFEBin _ (_,a) (_,b) -> matchLFE a >> matchLFE b
-	_matchReady (FELow sizedLFE) = do
-		(c, renames) <- mkReady sizedLFE
-		return (FELow c, renames)
-		where
-			mkReady (size, lfe) = case lfe of
-				LFEVar a -> _inventVarID Nothing >>= return . (,) (1, LFEReady $ Just a)  . Map.singleton a
-				LFEWild -> return (lfe', Map.empty)
-					where
-						FELow lfe' = constant True
-				LFEBin _ a b -> liftM2 combine (mkReady a) (mkReady b)
-					where
-						combine (r1, d1) (r2, d2) = ((1,LFEBin And r1 r2), Map.unionWithKey (\k -> error $ "non-linear match for "++show k) d1 d2)
+	matchExpressions (FELow sizedLFE) = [sizedLFE]
 
 instance Change (FE a) where
-	_changeHeader (FELow (_, lfe)) = case lfe of
-		LFEVar _ -> return ()
-		_ -> error "only variables are allowed in right hand of rule header."
-	_changeRename map (FELow (size, lfe)) = FELow $ (,) size $ renameLFE lfe
-		where
-			renameLFE lfe = case lfe of
-				LFEVar varid 
-					| Just v' <- Map.lookup varid map -> LFEVar v'
-					| otherwise -> lfe
-				LFEBin op (size1, a) (size2, b) -> LFEBin op (size1, renameLFE a) (size2, renameLFE b)
-				_ -> lfe
-	_change e = return $ constant False
+	changeExpressions (FELow sizedLFE) = [sizedLFE]
 
-_mkActor :: (FEList (LiftFE ins), FEList (LiftFE outs)) => String -> Maybe (StringList (LiftFE ins)) -> ActorBody (LiftFE ins) (LiftFE outs) -> Actor ins outs
+_mkActor :: (feIns ~LiftFE ins, feOuts ~ LiftFE outs, FEList feIns, FEList feOuts) => String -> Maybe (StringList feIns) -> ActorBody feIns feOuts -> Actor ins outs
 _mkActor name names body = flip evalState startABState $ do
 	ins <- inventList names
-	outs <- body ins
-	let outsVars = map checkVar $ _toSizedLFEs outs
-	return $ Actor name (_toSizedLFEs ins) outsVars
+	outs <- body (ins :: LiftFE ins)
+	rules <- liftM absRules get
+	return $ toActor ins outs rules
 	where
+		toActor :: LiftFE ins -> LiftFE outs -> [Rules] -> Actor ins outs
+		toActor ins outs rules = Actor name (_toSizedLFEs ins) (map checkVar $ _toSizedLFEs outs) rules
 		checkVar (sz,LFEVar n) = (sz,LFEVar n)
 		checkVar e = error $ "Actor "++show name++": output is not a variable: "++show e
 
@@ -612,12 +644,9 @@ $(liftM concat $ forM [2..8] $ \n -> let
 		tupleT ts = foldl TH.AppT (TH.TupleT (length ts)) ts
 		tupleFEs = tupleT fes
 		feTuple = TH.ConT ''FE `TH.AppT` tupleType
-		_matchHeaderCode = TH.FunD '_matchHeader
-			[TH.Clause [tupleP] (TH.NormalB $ TH.DoE stmts) []]
-			where
-				stmts = zipWith (\name ix -> TH.NoBindS $ TH.VarE '_setReady `TH.AppE` TH.VarE name `TH.AppE` TH.LitE (TH.IntegerL ix))
-					names [0..]
-		match = TH.InstanceD (map matchPred fes) (matchC tupleFEs) [_matchHeaderCode]
+		matchExpressionsCode = TH.FunD 'matchExpressions
+			[TH.Clause [tupleP] (TH.NormalB $ foldl1 (\a b -> TH.InfixE (Just a) (TH.VarE '(++)) (Just b)) $ map ((TH.VarE 'matchExpressions `TH.AppE` ) .  TH.VarE) names) []]
+		match = TH.InstanceD (map matchPred fes) (matchC tupleFEs) [matchExpressionsCode]
 		change = TH.InstanceD (map changePred fes) (changeC tupleFEs) []
 		tupleNName = TH.mkName $ "tuple"++show n
 		tupleNTy = TH.SigD tupleNName $ TH.ForallT (map TH.PlainTV names) (map bitReprPred types) $ TH.ArrowT `TH.AppT` tupleFEs `TH.AppT` feTuple

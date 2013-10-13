@@ -32,7 +32,7 @@ idA :: BitRepr a => Actor (a :. Nil) (a :. Nil)
 idA = actorN "id" ("a" :. Nil) $ \(i :. Nil) -> do
 	o <- autoN "o"
 	rules (i --> o)
-		[ i --> o]
+		[ i --> i]
 	return (o :. Nil)
 
 -- |Nil actor - accepts anything, produces nothing.
