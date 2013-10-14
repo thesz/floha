@@ -6,7 +6,7 @@
 
 {-# LANGUAGE GADTs, TypeFamilies, TypeOperators, FlexibleContexts, FlexibleInstances #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving, TemplateHaskell, PatternGuards, ScopedTypeVariables #-}
-{-# LANGUAGE UndecidableInstances #-}
+{-# LANGUAGE UndecidableInstances, StandaloneDeriving #-}
 
 module Language.Floha.Base
 	( (:.)(..)
@@ -75,7 +75,10 @@ type instance Max (S a) Z = S a
 type instance Max (S a) (S b) = S (Max a b)
 
 newtype NatI = NatI { fromNatI :: Integer}
-	deriving (Eq, Ord, Show, Num)
+	deriving (Eq, Ord, Num)
+
+instance Show NatI where
+	show = show . fromNatI
 
 class Nat a where
 	-- |Get the value of that type.
@@ -232,7 +235,7 @@ class Reset r where
 	-- |Is reset synchronous?
 	resetSynchronous :: r -> Bool
 
-class Reset (ClockReset c) => Clock c where
+class (Reset (ClockReset c), Show c) => Clock c where
 	-- |The type of clock reset signal.
 	type ClockReset c
 
@@ -248,6 +251,28 @@ class Reset (ClockReset c) => Clock c where
 	-- |Clock frequency.
 	clockFrequency :: c -> Rational
 
+-- |Default reset type for default clock.
+data DefaultReset = DefaultReset
+	deriving (Eq, Ord, Show)
+
+instance Reset DefaultReset where
+	resetName = show
+	resetPosActive = const False
+	resetSynchronous = const False
+
+data DefaultClock = DefaultClock
+	deriving (Eq, Ord, Show)
+
+instance Clock DefaultClock where
+	type ClockReset DefaultClock = DefaultReset
+	clockName = show
+	clockPosEdge = const True
+	clockReset = const DefaultReset
+	clockFrequency = const 100000000	-- 100 MHz
+
+data ClockHolder where
+	ClockHolder :: Clock c => c -> ClockHolder
+
 data Rules = Rules [SizedLFE] [SizedLFE] [([SizedLFE], [SizedLFE])]
 	deriving (Eq, Ord, Show)
 
@@ -255,9 +280,11 @@ data Rules = Rules [SizedLFE] [SizedLFE] [([SizedLFE], [SizedLFE])]
 data Actor ins outs where
 	-- |Actor is either real actor - a state machine.
 	-- Name of the actor, inputs, outputs, rules (there can be several rules sections) and clock information.
-	Actor :: Clock c => String -> [SizedLFE] -> [SizedLFE] -> [Rules] -> Maybe c -> Actor ins outs
+	Actor :: Clock c => String -> [SizedLFE] -> [SizedLFE] -> [Rules] -> c -> Actor ins outs
 	-- |Or actor is a network of connections between actors.
 	Network :: String -> Actor ins outs
+
+deriving instance Show (Actor ins outs)
 
 -------------------------------------------------------------------------------
 -- Main combinators.
@@ -315,6 +342,11 @@ report :: (BitRepr a, Show a) => FE Bool -> FE a -> ActorBodyM ()
 report condition value = do
 	error "report !!!"
 
+frequency :: Clock c => ActorBodyM Rational
+frequency = do
+	ClockHolder c <- liftM absClock get
+	return $ clockFrequency c
+
 -------------------------------------------------------------------------------
 -- Implementation.
 
@@ -329,6 +361,8 @@ data ABState = ABS {
 	, absOutputs		:: [SizedLFE]
 	-- |Rules.
 	, absRules		:: [Rules]
+	-- |Clock specification.
+	, absClock		:: ClockHolder
 	}
 
 type ActorBodyM a = State ABState a
@@ -353,6 +387,7 @@ startABState = ABS {
 	, absInputs		= []
 	, absOutputs		= []
 	, absRules		= []
+	, absClock		= ClockHolder DefaultClock
 	}
 
 _unique :: ActorBodyM Int
@@ -470,15 +505,16 @@ instance Match (FE a) where
 instance Change (FE a) where
 	changeExpressions (FELow sizedLFE) = [sizedLFE]
 
-_mkActor :: (feIns ~LiftFE ins, feOuts ~ LiftFE outs, FEList feIns, FEList feOuts) => String -> Maybe (StringList feIns) -> ActorBody feIns feOuts -> Actor ins outs
+_mkActor :: forall feIns feOuts ins outs . (feIns ~ LiftFE ins, feOuts ~ LiftFE outs, FEList feIns, FEList feOuts) => String -> Maybe (StringList feIns) -> ActorBody feIns feOuts -> Actor ins outs
 _mkActor name names body = flip evalState startABState $ do
-	ins <- inventList names
+	ins <- inventList names :: ActorBodyM (LiftFE ins)
 	outs <- body (ins :: LiftFE ins)
 	rules <- liftM absRules get
-	return $ toActor ins outs rules
+	ClockHolder c <- liftM absClock get
+	return $ toActor ins outs rules c
 	where
-		toActor :: LiftFE ins -> LiftFE outs -> [Rules] -> Actor ins outs
-		toActor ins outs rules = Actor name (_toSizedLFEs ins) (map checkVar $ _toSizedLFEs outs) rules
+		toActor :: (FEList (LiftFE ins), FEList (LiftFE outs), Clock c) => LiftFE ins -> LiftFE outs -> [Rules] -> c -> Actor ins outs
+		toActor ins outs rules c = Actor name (_toSizedLFEs ins) (map checkVar $ _toSizedLFEs outs) rules c
 		checkVar (sz,LFEVar n) = (sz,LFEVar n)
 		checkVar e = error $ "Actor "++show name++": output is not a variable: "++show e
 
