@@ -9,6 +9,7 @@
 
 module Language.Floha
 	( module Language.Floha.Base
+	, module Language.Floha.FPrelude
 	) where
 
 import Language.Floha.Base

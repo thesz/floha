@@ -230,7 +230,7 @@ class Reset r where
 	resetName :: r -> String
 
 	-- |Reset active polarity, True for positive (1).
-	resetPosActive :: r -> Bool
+	resetActiveHigh :: r -> Bool
 
 	-- |Is reset synchronous?
 	resetSynchronous :: r -> Bool
@@ -251,13 +251,33 @@ class (Reset (ClockReset c), Show c) => Clock c where
 	-- |Clock frequency.
 	clockFrequency :: c -> Rational
 
+data ClockInfo = ClockInfo {
+	  ciClockName		:: String
+	, ciResetName		:: String
+	, ciClockPosEdge	:: Bool
+	, ciResetSync		:: Bool
+	, ciResetActiveHigh	:: Bool
+	}
+	deriving (Eq, Ord, Show)
+
+clockInfo :: Clock c => c -> ClockInfo
+clockInfo c = ClockInfo {
+	  ciClockName		= clockName c
+	, ciResetName		= resetName r
+	, ciClockPosEdge	= clockPosEdge c
+	, ciResetSync		= resetSynchronous r
+	, ciResetActiveHigh	= resetActiveHigh r
+	}
+	where
+		r = clockReset c
+
 -- |Default reset type for default clock.
 data DefaultReset = DefaultReset
 	deriving (Eq, Ord, Show)
 
 instance Reset DefaultReset where
 	resetName = show
-	resetPosActive = const False
+	resetActiveHigh = const False
 	resetSynchronous = const False
 
 data DefaultClock = DefaultClock
@@ -265,10 +285,10 @@ data DefaultClock = DefaultClock
 
 instance Clock DefaultClock where
 	type ClockReset DefaultClock = DefaultReset
-	clockName = show
+	clockName = const "Default Clock does not have Verilog/VHDL compatible name. Please specify the real clock instead."
 	clockPosEdge = const True
 	clockReset = const DefaultReset
-	clockFrequency = const 100000000	-- 100 MHz
+	clockFrequency = const 1
 
 data ClockHolder where
 	ClockHolder :: Clock c => c -> ClockHolder
@@ -276,13 +296,23 @@ data ClockHolder where
 data Rules = Rules [SizedLFE] [SizedLFE] [([SizedLFE], [SizedLFE])]
 	deriving (Eq, Ord, Show)
 
+data Instance = Instance String [(ClockInfo, SizedLFE)] LLActor [(ClockInfo, SizedLFE)]
+	deriving (Eq, Ord, Show)
+
+data FIFO = FIFO SizedLFE Int
+	deriving (Eq, Ord, Show)
+
+-- |Low level representation of Floha actor.
+data LLActor =
+	-- state machine variant of actor.
+		LLActor	String [SizedLFE] [SizedLFE] (Map.Map VarID SizedLFE) [Rules] ClockInfo
+	-- network variant of actor.
+	|	LLNet String [(ClockInfo,SizedLFE)] [(ClockInfo, SizedLFE)] [Instance] [FIFO]
+	deriving (Eq, Ord, Show)
+
 -- |Floha actor.
 data Actor ins outs where
-	-- |Actor is either real actor - a state machine.
-	-- Name of the actor, inputs, outputs, rules (there can be several rules sections) and clock information.
-	Actor :: Clock c => String -> [SizedLFE] -> [SizedLFE] -> [Rules] -> c -> Actor ins outs
-	-- |Or actor is a network of connections between actors.
-	Network :: String -> Actor ins outs
+	Actor :: LLActor -> Actor ins outs
 
 deriving instance Show (Actor ins outs)
 
@@ -511,10 +541,11 @@ _mkActor name names body = flip evalState startABState $ do
 	outs <- body (ins :: LiftFE ins)
 	rules <- liftM absRules get
 	ClockHolder c <- liftM absClock get
-	return $ toActor ins outs rules c
+	initials <- liftM absInitials get
+	return $ toActor ins outs rules c initials
 	where
-		toActor :: (FEList (LiftFE ins), FEList (LiftFE outs), Clock c) => LiftFE ins -> LiftFE outs -> [Rules] -> c -> Actor ins outs
-		toActor ins outs rules c = Actor name (_toSizedLFEs ins) (map checkVar $ _toSizedLFEs outs) rules c
+		toActor :: (FEList (LiftFE ins), FEList (LiftFE outs), Clock c) => LiftFE ins -> LiftFE outs -> [Rules] -> c -> Map.Map VarID SizedLFE -> Actor ins outs
+		toActor ins outs rules c initials = Actor (LLActor name (_toSizedLFEs ins) (map checkVar $ _toSizedLFEs outs) initials rules (clockInfo c))
 		checkVar (sz,LFEVar n) = (sz,LFEVar n)
 		checkVar e = error $ "Actor "++show name++": output is not a variable: "++show e
 
