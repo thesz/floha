@@ -37,6 +37,8 @@ module Language.Floha.Base
 	, feTrue
 	, feUnit
 	, deriveBitRepr
+	, generateCode
+	, Language(..)
 	) where
 
 import Control.Monad
@@ -44,8 +46,13 @@ import Control.Monad.State
 
 import Data.Bits
 
+import Data.Int
 import qualified Data.Map as Map
+import Data.Maybe
+import Data.List(intercalate, nub)
 import qualified Data.Set as Set
+import Data.Word
+import Text.Printf
 
 import qualified Language.Haskell.TH as TH
 
@@ -68,6 +75,8 @@ data S n = S n
 type family Plus a b
 type instance Plus Z b = b
 type instance Plus (S a) b = S (Plus a b)
+
+type Twice a = Plus a a
 
 type family Max a b
 type instance Max Z (S b) = S b
@@ -285,7 +294,7 @@ data DefaultClock = DefaultClock
 
 instance Clock DefaultClock where
 	type ClockReset DefaultClock = DefaultReset
-	clockName = const "Default Clock does not have Verilog/VHDL compatible name. Please specify the real clock instead."
+	clockName = show
 	clockPosEdge = const True
 	clockReset = const DefaultReset
 	clockFrequency = const 1
@@ -304,6 +313,8 @@ data Instance = Instance String [(ClockInfo, SizedLFE)] [(ClockInfo, SizedLFE)] 
 data FIFO = FIFO SizedLFE Int
 	deriving (Eq, Ord, Show)
 
+type ClockedSizedLFE = (ClockInfo, SizedLFE)
+
 -- |Low level representation of Floha actor.
 data LLActor =
 	-- state machine variant of actor.
@@ -312,7 +323,7 @@ data LLActor =
 	-- network variant of actor.
 	-- includes: name, inputs and outputs with associated clock information, instances of actors and FIFO annotations
 	-- for channels.
-	|	LLNet String [(ClockInfo,SizedLFE)] [(ClockInfo, SizedLFE)] [Instance] [FIFO]
+	|	LLNet String [ClockedSizedLFE] [ClockedSizedLFE] [Instance] [FIFO]
 	deriving (Eq, Ord, Show)
 
 -- |Floha actor.
@@ -581,6 +592,9 @@ data Language = VHDL | Verilog
 data CGState = CGState {
 	-- |Unique index generator.
 	  cgsUnique		:: Int
+	-- |Nesting level.
+	, cgsNest		:: Int
+	-- |Language used throughout generated code.
 	, cgsLanguage		:: Language
 	-- |Generated lines of code.
 	, cgsRevLines		:: [String]
@@ -599,6 +613,7 @@ data CGState = CGState {
 startCGState :: Language -> CGState
 startCGState lang = CGState {
 	  cgsUnique		= 0
+	, cgsNest		= 0
 	, cgsLanguage		= lang
 	, cgsRevLines		= []
 	, cgsWarnings		= []
@@ -610,7 +625,13 @@ startCGState lang = CGState {
 type CGM a = State CGState a
 
 genLine :: String -> CGM ()
-genLine line = modify $ \cgs -> cgs { cgsRevLines = line : cgsRevLines cgs }
+genLine line = modify $
+	\cgs -> cgs {
+		  cgsRevLines = (if null line then "" else replicate (cgsNest cgs) ' ' ++ line) : cgsRevLines cgs
+		}
+
+genNL :: CGM ()
+genNL = genLine ""
 
 genLanguage :: CGM Language
 genLanguage = liftM cgsLanguage get
@@ -620,6 +641,14 @@ genWarning warning = do
 	(actorName, uniqueActorName) <- liftM cgsCurrentActor get
 	let w = "actor "++show actorName++", unique name "++show uniqueActorName++". warning: "++warning
 	modify $ \cgs -> cgs { cgsWarnings = w : cgsWarnings cgs }
+
+genNest :: CGM a -> CGM a
+genNest act = do
+	n <- liftM cgsNest get
+	modify $ \cgs -> cgs { cgsNest = n + 4 }
+	r <- act
+	modify $ \cgs -> cgs { cgsNest = n }
+	return r
 
 genComment :: String -> CGM ()
 genComment line = do
@@ -632,6 +661,40 @@ actorName :: LLActor -> String
 actorName (LLActor name _ _ _ _ _) = name
 actorName (LLNet name _ _ _ _) = name
 
+underscoredIndices :: String -> [Int] -> String
+underscoredIndices name ns = intercalate "_" (name : map show ns)
+
+varIDToStr :: VarID -> String
+varIDToStr (VarID s ns) = underscoredIndices (fromMaybe "generated_var" s) ns
+
+genModuleHeader :: String -> [ClockedSizedLFE] -> [ClockedSizedLFE] -> [ClockInfo] -> CGM ()
+genModuleHeader un ins outs clocks = do
+	l <- genLanguage
+	case l of
+		Verilog -> do
+			genLine $ "module "++un
+			let cs = map ((,) "input " . (\c -> (1,VarID (Just c) []))) (clks ++ resets)
+			let fullInputs = concatMap (signal "input " "output") ins
+			let fullOutputs = concatMap (signal "output" "input ") outs
+			genNest $ do
+				forM_ (zipWith (,) ("(" : repeat ",") (cs++fullInputs ++ fullOutputs)) $ \(comma,(direction,(size, v))) -> do
+					if size > 0
+						then genLine $ unwords [comma, direction, vlSize size, varIDToStr v]
+						else return ()
+				genLine ");"
+			genNL
+		VHDL -> do
+			genLine "VHDL QQ"
+	return ()
+	where
+		clks = nub $ map ciClockName clocks
+		resets = nub $ map ciResetName clocks
+		signal dirTo dirFrom (_,(size, LFEVar vid)) = [(dirTo, (size, vid)), (dirTo, (1, vid)), (dirFrom, (1, vid))]
+		signal _ _ (_,(_, e)) = internal $ "not a variable: "++show e
+		vlSize = take 16 . vlSize'
+		vlSize' 1 = repeat ' '
+		vlSize' n = printf "[%d:0]" (fromNatI (n-1))++ repeat ' '
+
 -- |Generate code from actor (either just an actor or network).
 generateCode :: Language -> Actor ins outs -> ([String], String)
 generateCode lang (Actor actor) = flip evalState (startCGState lang) $ do
@@ -640,9 +703,41 @@ generateCode lang (Actor actor) = flip evalState (startCGState lang) $ do
 	genComment $ "Top level Floha actor: "++actorName actor
 	genLine ""
 	genLine ""
+	gen actor
 	lines <- liftM cgsRevLines get
 	warns <- liftM cgsWarnings get
 	return (reverse warns, unlines $ reverse lines)
+	where
+		gen a = do
+			uniqueName <- findName a
+			case uniqueName of
+				Nothing -> return ()
+				Just un -> do
+					oldAN <- liftM cgsCurrentActor get
+					modify $ \cgs -> cgs { cgsCurrentActor = (actorName a, un) }
+					l <- genLanguage
+					code un a
+					modify $ \cgs -> cgs { cgsCurrentActor = oldAN }
+		code un (LLActor name ins outs _ _ ci) = do
+			genComment $ "Actor "++name++"."
+			let clocked = zipWith (,) (repeat ci)
+			genModuleHeader un (clocked ins) (clocked outs) [ci]
+			return ()
+		findName a = do
+			name <- liftM (Map.lookup a . cgsActorsVisited) get
+			case name of
+				Just a -> return Nothing
+				Nothing -> liftM Just $ inventName $ actorName a
+		inventName a = do
+			checkInvent a (inventName' 1 a)
+		inventName' n a = checkInvent (underscoredIndices a [n]) (inventName' (n+1) a)
+		checkInvent name cont = do
+			registered <- liftM (Set.member name . cgsUsedActorNames) get
+			if registered
+				then cont
+				else do
+					modify $ \cgs -> cgs { cgsUsedActorNames = Set.insert name $ cgsUsedActorNames cgs }
+					return name
 
 
 -------------------------------------------------------------------------------
@@ -653,6 +748,12 @@ instance BitRepr Bool where
 	safeValue = False
 	encode = fromInteger . fromIntegral . fromEnum
 	decode = toEnum . fromIntegral . fromBitVectConst
+
+instance BitRepr Word8 where
+	type BitSize Word8 = Twice (Twice (Twice (S Z)))
+	safeValue = 0
+	encode = fromInteger . fromIntegral
+	decode = fromIntegral . fromBitVectConst
 
 feFalse :: FE Bool
 feFalse = FELow (1, LFEConst 0)

@@ -9,6 +9,8 @@
 
 module Language.Floha.FPrelude where
 
+import Data.Word
+
 import Language.Floha.Base
 
 -------------------------------------------------------------------------------
@@ -111,3 +113,17 @@ arbiterA = actorN "arbiter" ("left" :. "right" :. Nil) $ \(left :. right :. Nil)
 		]
 	return (o :. Nil)
 
+-------------------------------------------------------------------------------
+-- Inline tests.
+
+boolIdA :: Actor (Bool :. Nil) (Bool :. Nil)
+boolIdA = idA
+
+word8IdA :: Actor (Word8 :. Nil) (Word8 :. Nil)
+word8IdA = idA
+
+boolIdAVlog = generateCode Verilog word8IdA
+boolIdAVHDL = generateCode VHDL    word8IdA
+
+t = putStrLn $ snd boolIdAVlog
+t1 = putStrLn $ snd boolIdAVHDL
