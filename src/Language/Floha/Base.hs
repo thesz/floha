@@ -132,8 +132,12 @@ class Nat (BitSize a) => BitRepr a where
 -------------------------------------------------------------------------------
 -- HList.
 
+-- |Kind of variable.
+data VarK = Var | Ready | Valid
+	deriving (Eq, Ord, Show)
+
 -- |How we identify variables.
-data VarID = VarID (Maybe String) [Int]
+data VarID = VarID (Maybe String) [Int] VarK
 	deriving (Eq, Ord, Show)
 
 -- |Compile-time constant size bit vectors are a necessity.
@@ -440,7 +444,7 @@ _unique :: ActorBodyM Int
 _unique = modify (\abs -> abs { absUnique = absUnique abs + 1 }) >> liftM absUnique get
 
 _inventVarID :: Maybe String -> ActorBodyM VarID
-_inventVarID name = liftM (VarID name . (\n -> [n])) _unique
+_inventVarID name = liftM (($ Var) . VarID name . (\n -> [n])) _unique
 
 _setInitial :: VarID -> SizedLFE -> ActorBodyM ()
 _setInitial v init = modify $ \abs -> abs { absInitials = Map.insert v init $ absInitials abs }
@@ -661,19 +665,27 @@ actorName :: LLActor -> String
 actorName (LLActor name _ _ _ _ _) = name
 actorName (LLNet name _ _ _ _) = name
 
-underscoredIndices :: String -> [Int] -> String
-underscoredIndices name ns = intercalate "_" (name : map show ns)
+underscoredIndices :: String -> [Int] -> VarK -> String
+underscoredIndices name ns k = intercalate "_" (name : map show ns ++ kindStr)
+	where
+		kindStr = case k of
+			Var -> []
+			Ready -> ["ready"]
+			Valid -> ["valid"]
 
 varIDToStr :: VarID -> String
-varIDToStr (VarID s ns) = underscoredIndices (fromMaybe "generated_var" s) ns
+varIDToStr (VarID s ns k) = underscoredIndices (fromMaybe "generated_var" s) ns k
 
-genModuleHeader :: String -> [ClockedSizedLFE] -> [ClockedSizedLFE] -> [ClockInfo] -> CGM ()
-genModuleHeader un ins outs clocks = do
+changeKind :: VarK -> VarID -> VarID
+changeKind k (VarID name ns _) = VarID name ns k
+
+genModule :: String -> [ClockedSizedLFE] -> [ClockedSizedLFE] -> [ClockInfo] -> CGM ()
+genModule un ins outs clocks = do
 	l <- genLanguage
 	case l of
 		Verilog -> do
 			genLine $ "module "++un
-			let cs = map ((,) "input " . (\c -> (1,VarID (Just c) []))) (clks ++ resets)
+			let cs = map ((,) "input " . (\c -> (1,VarID (Just c) [] Var))) (clks ++ resets)
 			let fullInputs = concatMap (signal "input " "output") ins
 			let fullOutputs = concatMap (signal "output" "input ") outs
 			genNest $ do
@@ -683,13 +695,14 @@ genModuleHeader un ins outs clocks = do
 						else return ()
 				genLine ");"
 			genNL
+			genLine "endmodule"
 		VHDL -> do
 			genLine "VHDL QQ"
 	return ()
 	where
 		clks = nub $ map ciClockName clocks
 		resets = nub $ map ciResetName clocks
-		signal dirTo dirFrom (_,(size, LFEVar vid)) = [(dirTo, (size, vid)), (dirTo, (1, vid)), (dirFrom, (1, vid))]
+		signal dirTo dirFrom (_,(size, LFEVar vid)) = [(dirTo, (size, vid)), (dirTo, (1, changeKind Valid vid)), (dirFrom, (1, changeKind Ready vid))]
 		signal _ _ (_,(_, e)) = internal $ "not a variable: "++show e
 		vlSize = take 16 . vlSize'
 		vlSize' 1 = repeat ' '
@@ -721,7 +734,7 @@ generateCode lang (Actor actor) = flip evalState (startCGState lang) $ do
 		code un (LLActor name ins outs _ _ ci) = do
 			genComment $ "Actor "++name++"."
 			let clocked = zipWith (,) (repeat ci)
-			genModuleHeader un (clocked ins) (clocked outs) [ci]
+			genModule un (clocked ins) (clocked outs) [ci]
 			return ()
 		findName a = do
 			name <- liftM (Map.lookup a . cgsActorsVisited) get
@@ -730,7 +743,7 @@ generateCode lang (Actor actor) = flip evalState (startCGState lang) $ do
 				Nothing -> liftM Just $ inventName $ actorName a
 		inventName a = do
 			checkInvent a (inventName' 1 a)
-		inventName' n a = checkInvent (underscoredIndices a [n]) (inventName' (n+1) a)
+		inventName' n a = checkInvent (underscoredIndices a [n] Var) (inventName' (n+1) a)
 		checkInvent name cont = do
 			registered <- liftM (Set.member name . cgsUsedActorNames) get
 			if registered
