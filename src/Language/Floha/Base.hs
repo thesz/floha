@@ -123,8 +123,8 @@ class Nat (BitSize a) => BitRepr a where
 -------------------------------------------------------------------------------
 -- HList.
 
--- |How we identify vars.
-data VarID = VarID (Maybe String) Int
+-- |How we identify variables.
+data VarID = VarID (Maybe String) [Int]
 	deriving (Eq, Ord, Show)
 
 -- |Compile-time constant size bit vectors are a necessity.
@@ -296,17 +296,22 @@ data ClockHolder where
 data Rules = Rules [SizedLFE] [SizedLFE] [([SizedLFE], [SizedLFE])]
 	deriving (Eq, Ord, Show)
 
-data Instance = Instance String [(ClockInfo, SizedLFE)] LLActor [(ClockInfo, SizedLFE)]
+-- |Instance of an actor. Name of instance, clocked inputs and outputs and the internal representation of an actor.
+data Instance = Instance String [(ClockInfo, SizedLFE)] [(ClockInfo, SizedLFE)] LLActor
 	deriving (Eq, Ord, Show)
 
+-- |FIFO annotation. What channel FIFO is added to and the size.
 data FIFO = FIFO SizedLFE Int
 	deriving (Eq, Ord, Show)
 
 -- |Low level representation of Floha actor.
 data LLActor =
 	-- state machine variant of actor.
+	-- includes: name, inputs, outputs, assignments for the variables, matching rules (at least one) and clock information.
 		LLActor	String [SizedLFE] [SizedLFE] (Map.Map VarID SizedLFE) [Rules] ClockInfo
 	-- network variant of actor.
+	-- includes: name, inputs and outputs with associated clock information, instances of actors and FIFO annotations
+	-- for channels.
 	|	LLNet String [(ClockInfo,SizedLFE)] [(ClockInfo, SizedLFE)] [Instance] [FIFO]
 	deriving (Eq, Ord, Show)
 
@@ -424,7 +429,7 @@ _unique :: ActorBodyM Int
 _unique = modify (\abs -> abs { absUnique = absUnique abs + 1 }) >> liftM absUnique get
 
 _inventVarID :: Maybe String -> ActorBodyM VarID
-_inventVarID name = liftM (VarID name) _unique
+_inventVarID name = liftM (VarID name . (\n -> [n])) _unique
 
 _setInitial :: VarID -> SizedLFE -> ActorBodyM ()
 _setInitial v init = modify $ \abs -> abs { absInitials = Map.insert v init $ absInitials abs }
@@ -572,15 +577,73 @@ simulate actor seqlist = error "simulate!!!"
 data Language = VHDL | Verilog
 	deriving (Eq, Ord, Show)
 
--- |Result of code generation.
-data GeneratedCode = GCode {
-	  genTopLevel		:: String
-	, genText		:: String
+-- |Code generation monad internal state.
+data CGState = CGState {
+	-- |Unique index generator.
+	  cgsUnique		:: Int
+	, cgsLanguage		:: Language
+	-- |Generated lines of code.
+	, cgsRevLines		:: [String]
+	-- |List of warnings.
+	, cgsWarnings		:: [String]
+	-- |Current actor being generated (for warnings generation). Includes both original and unique names.
+	, cgsCurrentActor	:: (String, String)
+	-- |Set of used actor names. We can have idA applied to Bool and Int32 channels, they will be
+	-- different actors, actually.
+	, cgsUsedActorNames	:: Set.Set String
+	-- |Maping between actors and their names.
+	, cgsActorsVisited	:: Map.Map LLActor String
+	}
+	deriving (Eq, Ord, Show)
+
+startCGState :: Language -> CGState
+startCGState lang = CGState {
+	  cgsUnique		= 0
+	, cgsLanguage		= lang
+	, cgsRevLines		= []
+	, cgsWarnings		= []
+	, cgsCurrentActor	= error "no current actor is set."
+	, cgsUsedActorNames	= Set.empty
+	, cgsActorsVisited	= Map.empty
 	}
 
+type CGM a = State CGState a
+
+genLine :: String -> CGM ()
+genLine line = modify $ \cgs -> cgs { cgsRevLines = line : cgsRevLines cgs }
+
+genLanguage :: CGM Language
+genLanguage = liftM cgsLanguage get
+
+genWarning :: String -> CGM ()
+genWarning warning = do
+	(actorName, uniqueActorName) <- liftM cgsCurrentActor get
+	let w = "actor "++show actorName++", unique name "++show uniqueActorName++". warning: "++warning
+	modify $ \cgs -> cgs { cgsWarnings = w : cgsWarnings cgs }
+
+genComment :: String -> CGM ()
+genComment line = do
+	l <- genLanguage
+	genLine $ (++" "++line) $ case l of
+		VHDL -> "--"
+		Verilog -> "//"
+
+actorName :: LLActor -> String
+actorName (LLActor name _ _ _ _ _) = name
+actorName (LLNet name _ _ _ _) = name
+
 -- |Generate code from actor (either just an actor or network).
-generateCode :: Language -> Actor ins outs -> GeneratedCode
-generateCode lang actor = error "generateCode"
+generateCode :: Language -> Actor ins outs -> ([String], String)
+generateCode lang (Actor actor) = flip evalState (startCGState lang) $ do
+	genComment $ "GENERATED CODE!!! DO NOT MODIFY!!!"
+	genComment $ ""
+	genComment $ "Top level Floha actor: "++actorName actor
+	genLine ""
+	genLine ""
+	lines <- liftM cgsRevLines get
+	warns <- liftM cgsWarnings get
+	return (reverse warns, unlines $ reverse lines)
+
 
 -------------------------------------------------------------------------------
 -- Instances of various classes for various types.
