@@ -27,6 +27,7 @@ module Language.Floha.Base
 	, initial
 	, __
 	, rules
+	, rulesND
 	, constant
 	, report
 	, simulate
@@ -157,10 +158,6 @@ data LowFE =
 	|	LFEVar		VarID
 	-- wildarg. Can be pattern and value.
 	|	LFEWild
-	-- "ready" signal from output. Means that output will take the value.
-	|	LFEReady	VarID
-	-- "valid" signal from input. Means that value is valid, e.g., the computation with this value will be valid too.
-	|	LFEValid	VarID
 	-- Various binary operations.
 	|	LFEBin		LFWBinOp	SizedLFE	SizedLFE
 	-- Concatenation of expressions, basically curly brackets from Verilog.
@@ -169,7 +166,7 @@ data LowFE =
 	-- The size should be high-low+1.
 	|	LFESub		SizedLFE	Int	Int
 	-- Change size from one to another. Change to smaller size basically is the same as LFESub v (size-1) 0.
-	|	LFEChangeSize	ChangeFiller	(SizedLFE)
+	|	LFEChangeSize	ChangeFiller	SizedLFE
 	-- The register assignment. Arguments are name of the clock, default value (after reset) and the computed value.
 	|	LFERegister	String	BitVectConst	SizedLFE
 	deriving (Eq, Ord, Show)
@@ -306,7 +303,10 @@ instance Clock DefaultClock where
 data ClockHolder where
 	ClockHolder :: Clock c => c -> ClockHolder
 
-data Rules = Rules [SizedLFE] [SizedLFE] [([SizedLFE], [SizedLFE])]
+data RulesType = Deterministic | NonDeterministic
+	deriving (Eq, Ord, Show)
+
+data Rules = Rules RulesType [SizedLFE] [SizedLFE] [([SizedLFE], [SizedLFE])]
 	deriving (Eq, Ord, Show)
 
 -- |Instance of an actor. Name of instance, clocked inputs and outputs and the internal representation of an actor.
@@ -348,9 +348,17 @@ actorN name names body = _mkActor name (Just names) body
 net :: String -> Actor ins outs
 net name = error "net is not yet ready."
 
+-- |Deterministic version of rules - it does not take into account readyness of the outputs.
 rules :: (Match matchE, Change changeE) => (matchE, changeE) -> [(matchE, changeE)] -> ActorBodyM ()
 rules (headerMatch, headerResults) matchChanges = do
-	let r = Rules (matchExpressions headerMatch) (changeExpressions headerResults)
+	let r = Rules Deterministic (matchExpressions headerMatch) (changeExpressions headerResults)
+		(map (\(m,c) -> (matchExpressions m, changeExpressions c)) matchChanges)
+	modify $ \abs -> abs { absRules = r : absRules abs }
+
+-- |Non-deterministic rules - rule considered firing if patterns matches and valid and outputs are ready.
+rulesND :: (Match matchE, Change changeE) => (matchE, changeE) -> [(matchE, changeE)] -> ActorBodyM ()
+rulesND (headerMatch, headerResults) matchChanges = do
+	let r = Rules NonDeterministic (matchExpressions headerMatch) (changeExpressions headerResults)
 		(map (\(m,c) -> (matchExpressions m, changeExpressions c)) matchChanges)
 	modify $ \abs -> abs { absRules = r : absRules abs }
 
@@ -449,6 +457,11 @@ _inventVarID name = liftM (($ Var) . VarID name . (\n -> [n])) _unique
 _setInitial :: VarID -> SizedLFE -> ActorBodyM ()
 _setInitial v init = modify $ \abs -> abs { absInitials = Map.insert v init $ absInitials abs }
 
+cloneVarID :: VarID -> ActorBodyM VarID
+cloneVarID (VarID n ns k) = do
+	suffix <- _unique
+	return $ VarID n (ns ++ [suffix]) k
+
 inventVar :: BitRepr a => Maybe String -> ActorBodyM (FE a)
 inventVar name = do
 	v <- _inventVarID name
@@ -501,53 +514,12 @@ lfeTrue, lfeFalse :: SizedLFE
 [lfeTrue, lfeFalse] = map encodeConst [True, False]
 
 lfeReady, lfeValid :: VarID -> SizedLFE
-lfeReady vid = (1, LFEReady vid)
-lfeValid vid = (1, LFEValid vid)
+lfeReady (VarID n ns k) = (1, LFEVar (VarID n ns Ready))
+lfeValid (VarID n ns k) = (1, LFEVar (VarID n ns Valid))
 
 lfeEqual, lfeAnd :: SizedLFE -> SizedLFE -> SizedLFE
 lfeEqual a@(s, _) b = (s, LFEBin Equal a b)
 lfeAnd a b = (fst a, LFEBin And a b)
-
-{-
-addAssignment :: VarID -> SizedLFE -> ActorBodyM ()
-addAssignment vid e = do
-	asgns <- liftM absAssignments get
-	when (vid `elem` map fst asgns) $ internal $ "duplicate assignment "++show vid
-	modify $ \abs -> abs { absAssignments = (vid,e) : absAssignments abs }
-
--- |Add match assignments to the list of assignments of actor's body.
--- First argument is an input, second one is match pattern.
--- Returns:
---  - "valid" signal to indicate that data present is valid,
---  - "matched" signal to indicate that match is successful and
---  - "ready" signal to indicate readiness to take value from the input.
--- The input can be only variable.
-addMatchAssignments :: SizedLFE -> SizedLFE -> ActorBodyM (SizedLFE, SizedLFE, SizedLFE)
-addMatchAssignments ei@(n1,LFEVar inputVar) slfe@(n2,_)
-	| n1 /= n2 = error "internal error: different sizes in addMatchAssignments!"
-	| otherwise = do
-		genAsgns inputVar ei slfe
-	where
-		inputValid = lfeValid inputVar
-		inputReady = lfeReady inputVar
-		genAsgns _ (_,LFEWild) = do
-			return (lfeTrue, lfeTrue, lfeFalse)
-		genAsgns e (_,LFEVar vid) = do
-			addAssignment vid e
-			return (lfe, lfeTrue, lfeReady inputVar)
-		genAsgns e p@(sz, LFEConst c) = do
-			return (inputValid, lfeEqual e p, lfeReady inputVar)
-		genAsgns e p@(sz, LFECat slfes) = do
-			let accSizes = scanr (+) 0 $ map fst slfes
-			let lows = tail accSizes
-			let highs = map (flip (-) 1) $ init accSizes
-			results <- forM (zip3 slfes $ \(high, low, p@(sz,_)) -> do
-				vid <- _inventVarID Nothing
-				addAssignment vid $ (sz,LFESub high low e)
-				genAsgns inputValid (sz, LFEVar vid) p
-			return (inputValid, foldl1 lfeAnd (map (\(a,b,c) -> b) results), 
-addMatchAssignments _ _ = error "internal error: input is not a variable at addMatchAssignments!"
--}
 
 instance Match (FE a) where
 	matchExpressions (FELow sizedLFE) = [sizedLFE]
@@ -562,10 +534,62 @@ _mkActor name names body = flip evalState startABState $ do
 	rules <- liftM absRules get
 	ClockHolder c <- liftM absClock get
 	initials <- liftM absInitials get
-	return $ toActor ins outs rules c initials
+	let insLFEs = _toSizedLFEs ins
+	    outsLFEs = _toSizedLFEs outs
+	when (nonUnique insLFEs) $ error $ "Input names are not unique in "++name
+	when (nonUnique outsLFEs) $ error $ "Output names are not unique in "++name
+	let renameIO (LFEVar v@(VarID (Just n) ns k)) = Map.singleton v (VarID (Just n) (tail ns) k)
+	    renameIO v = Map.empty
+	let ioRenames = Map.unions $ map renameIO $ map snd $ insLFEs ++ outsLFEs
+	rules <- forM rules $ renameRulesVars ioRenames
+	return $ toActor ioRenames ins outs rules c initials
 	where
-		toActor :: (FEList (LiftFE ins), FEList (LiftFE outs), Clock c) => LiftFE ins -> LiftFE outs -> [Rules] -> c -> Map.Map VarID SizedLFE -> Actor ins outs
-		toActor ins outs rules c initials = Actor (LLActor name (_toSizedLFEs ins) (map checkVar $ _toSizedLFEs outs) initials rules (clockInfo c))
+		renameAny :: Map.Map VarID VarID -> SizedLFE -> SizedLFE
+		renameAny rmap (sz, e) = (,) sz $ case e of
+			LFEVar v -> case Map.lookup v rmap of
+				Just v -> LFEVar v
+				Nothing -> e
+			LFEBin op a b -> LFEBin op (renameAny rmap a) (renameAny rmap b)
+			LFECat es -> LFECat $ map (renameAny rmap) es
+			LFESub a o1 o2 -> LFESub (renameAny rmap a) o1 o2
+			LFEChangeSize filler a -> LFEChangeSize filler (renameAny rmap a)
+			LFERegister x y a -> LFERegister x y (renameAny rmap a)
+
+		renameRulesVars :: Map.Map VarID VarID -> Rules -> ActorBodyM Rules
+		renameRulesVars renames (Rules rulesType headerFrom headerTo matchChanges) = do
+			matchChanges' <- forM matchChanges $ \(p',e') -> do
+				let p = map rename p'
+				    e = map rename e'
+				rs <- liftM Map.unions $ mapM (inventRenames Map.empty) p
+				return (map (renameAny rs) p, map (renameAny rs) e)
+			return $ Rules rulesType headerFrom' headerTo' matchChanges'
+			where
+				inventRenames map (_,e) = case e of
+					LFEVar v -> liftM (flip (Map.insert v) map) $ cloneVarID v
+					LFEBin _ a b -> liftM2 (Map.union) (inventRenames map a) (inventRenames map b)
+					LFECat es -> liftM Map.unions $ mapM (inventRenames map) es
+					LFESub a _ _ -> inventRenames map a
+					LFEChangeSize _ a -> inventRenames map a
+					LFERegister _ _ a -> inventRenames map a
+
+				rename = renameAny renames
+
+				headerTo' = map rename headerTo
+				headerFrom' = map rename headerFrom
+		nonUnique :: [SizedLFE] -> Bool
+		nonUnique [] = False
+		nonUnique vs
+			| all isNothing mbNames = False
+			| all isJust mbNames = checkDuplicates (catMaybes mbNames)
+			| otherwise = error $ "Not all outputs are named in "++name
+			where
+				mbNames = map getName vs
+				getName (_, LFEVar (VarID v _ _)) = v
+				getName _ = internal $ "output is not a variable in "++name
+		checkDuplicates (s:ss) = elem s ss || checkDuplicates ss
+		checkDuplicates [] = False
+		toActor :: (FEList (LiftFE ins), FEList (LiftFE outs), Clock c) => Map.Map VarID VarID -> LiftFE ins -> LiftFE outs -> [Rules] -> c -> Map.Map VarID SizedLFE -> Actor ins outs
+		toActor ioRenames ins outs rules c initials = Actor (LLActor name (map (renameAny ioRenames) $ _toSizedLFEs ins) (map checkVar $ map (renameAny ioRenames) $ _toSizedLFEs outs) initials rules (clockInfo c))
 		checkVar (sz,LFEVar n) = (sz,LFEVar n)
 		checkVar e = error $ "Actor "++show name++": output is not a variable: "++show e
 
@@ -679,8 +703,8 @@ varIDToStr (VarID s ns k) = underscoredIndices (fromMaybe "generated_var" s) ns 
 changeKind :: VarK -> VarID -> VarID
 changeKind k (VarID name ns _) = VarID name ns k
 
-genModule :: String -> [ClockedSizedLFE] -> [ClockedSizedLFE] -> [ClockInfo] -> CGM ()
-genModule un ins outs clocks = do
+genModule :: String -> [ClockedSizedLFE] -> [ClockedSizedLFE] -> [ClockInfo] -> CGM () -> CGM ()
+genModule un ins outs clocks compileRules = do
 	l <- genLanguage
 	case l of
 		Verilog -> do
@@ -695,9 +719,14 @@ genModule un ins outs clocks = do
 						else return ()
 				genLine ");"
 			genNL
-			genLine "endmodule"
+
 		VHDL -> do
 			genLine "VHDL QQ"
+	compileRules
+	case l of
+		Verilog -> do
+			genNL
+			genLine "endmodule"
 	return ()
 	where
 		clks = nub $ map ciClockName clocks
@@ -707,6 +736,14 @@ genModule un ins outs clocks = do
 		vlSize = take 16 . vlSize'
 		vlSize' 1 = repeat ' '
 		vlSize' n = printf "[%d:0]" (fromNatI (n-1))++ repeat ' '
+
+genCompileRules :: String -> ClockInfo -> [SizedLFE] -> [SizedLFE] -> Map.Map VarID SizedLFE -> [Rules] -> CGM ()
+genCompileRules name ci ins outs initials [] = internal $ "no rules for "++name++"."
+genCompileRules name ci ins outs initials [Rules rulesType hLeft hRight matches] = do
+	genComment "Rules - single instance."
+	
+genCompileRules name ci ins outs initials manyRules = do
+	internal $ "multiple rules aren't supported. actor "++name
 
 -- |Generate code from actor (either just an actor or network).
 generateCode :: Language -> Actor ins outs -> ([String], String)
@@ -731,10 +768,10 @@ generateCode lang (Actor actor) = flip evalState (startCGState lang) $ do
 					l <- genLanguage
 					code un a
 					modify $ \cgs -> cgs { cgsCurrentActor = oldAN }
-		code un (LLActor name ins outs _ _ ci) = do
+		code un (LLActor name ins outs initials rules ci) = do
 			genComment $ "Actor "++name++"."
 			let clocked = zipWith (,) (repeat ci)
-			genModule un (clocked ins) (clocked outs) [ci]
+			genModule un (clocked ins) (clocked outs) [ci] (genCompileRules name ci ins outs initials rules)
 			return ()
 		findName a = do
 			name <- liftM (Map.lookup a . cgsActorsVisited) get
