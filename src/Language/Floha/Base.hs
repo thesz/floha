@@ -50,7 +50,7 @@ import Data.Bits
 import Data.Int
 import qualified Data.Map as Map
 import Data.Maybe
-import Data.List(intercalate, nub)
+import Data.List(intercalate, nub, isPrefixOf)
 import qualified Data.Set as Set
 import Data.Word
 import Text.Printf
@@ -452,7 +452,12 @@ _unique :: ActorBodyM Int
 _unique = modify (\abs -> abs { absUnique = absUnique abs + 1 }) >> liftM absUnique get
 
 _inventVarID :: Maybe String -> ActorBodyM VarID
-_inventVarID name = liftM (($ Var) . VarID name . (\n -> [n])) _unique
+_inventVarID name = checkName name >> liftM (($ Var) . VarID name . (\n -> [n])) _unique
+	where
+		checkName Nothing = return ()
+		checkName (Just n)
+			| isPrefixOf "fevar_" n = error $ "invalid variable name "++show n++". choose another prefix (up to underscore)."
+			| otherwise = return ()
 
 _setInitial :: VarID -> SizedLFE -> ActorBodyM ()
 _setInitial v init = modify $ \abs -> abs { absInitials = Map.insert v init $ absInitials abs }
@@ -513,9 +518,18 @@ internal s = error $ "internal error: "++s
 lfeTrue, lfeFalse :: SizedLFE
 [lfeTrue, lfeFalse] = map encodeConst [True, False]
 
-lfeReady, lfeValid :: VarID -> SizedLFE
-lfeReady (VarID n ns k) = (1, LFEVar (VarID n ns Ready))
-lfeValid (VarID n ns k) = (1, LFEVar (VarID n ns Valid))
+varLFEReady, varLFEValid :: VarID -> SizedLFE
+varLFEReady (VarID n ns k) = (1, LFEVar (VarID n ns Ready))
+varLFEValid (VarID n ns k) = (1, LFEVar (VarID n ns Valid))
+
+lfeReady, lfeValid :: SizedLFE -> SizedLFE
+(lfeReady, lfeValid) = (recurse varLFEReady, recurse varLFEValid)
+	where
+		recurse change (_,e) = case e of
+			LFEConst _ -> lfeTrue
+			LFEVar v -> change v
+			LFEBin op a b -> lfeAnd (recurse change a) (recurse change b)
+			_ -> error $ "recurse in lfeReady/Valid, expression "++show e
 
 lfeEqual, lfeAnd :: SizedLFE -> SizedLFE -> SizedLFE
 lfeEqual a@(s, _) b = (s, LFEBin Equal a b)
@@ -536,8 +550,10 @@ _mkActor name names body = flip evalState startABState $ do
 	initials <- liftM absInitials get
 	let insLFEs = _toSizedLFEs ins
 	    outsLFEs = _toSizedLFEs outs
-	when (nonUnique insLFEs) $ error $ "Input names are not unique in "++name
-	when (nonUnique outsLFEs) $ error $ "Output names are not unique in "++name
+	let anError c e = when c $ error $ name++": "++e
+	anError (nonUnique insLFEs) $ "input names are not unique."
+	anError (nonUnique outsLFEs) $ "output names are not unique."
+	anError (null rules) $ "no rules."
 	let renameIO (LFEVar v@(VarID (Just n) ns k)) = Map.singleton v (VarID (Just n) (tail ns) k)
 	    renameIO v = Map.empty
 	let ioRenames = Map.unions $ map renameIO $ map snd $ insLFEs ++ outsLFEs
@@ -576,6 +592,7 @@ _mkActor name names body = flip evalState startABState $ do
 
 				headerTo' = map rename headerTo
 				headerFrom' = map rename headerFrom
+
 		nonUnique :: [SizedLFE] -> Bool
 		nonUnique [] = False
 		nonUnique vs
@@ -586,10 +603,13 @@ _mkActor name names body = flip evalState startABState $ do
 				mbNames = map getName vs
 				getName (_, LFEVar (VarID v _ _)) = v
 				getName _ = internal $ "output is not a variable in "++name
+
 		checkDuplicates (s:ss) = elem s ss || checkDuplicates ss
 		checkDuplicates [] = False
+
 		toActor :: (FEList (LiftFE ins), FEList (LiftFE outs), Clock c) => Map.Map VarID VarID -> LiftFE ins -> LiftFE outs -> [Rules] -> c -> Map.Map VarID SizedLFE -> Actor ins outs
 		toActor ioRenames ins outs rules c initials = Actor (LLActor name (map (renameAny ioRenames) $ _toSizedLFEs ins) (map checkVar $ map (renameAny ioRenames) $ _toSizedLFEs outs) initials rules (clockInfo c))
+
 		checkVar (sz,LFEVar n) = (sz,LFEVar n)
 		checkVar e = error $ "Actor "++show name++": output is not a variable: "++show e
 
@@ -635,6 +655,9 @@ data CGState = CGState {
 	, cgsUsedActorNames	:: Set.Set String
 	-- |Maping between actors and their names.
 	, cgsActorsVisited	:: Map.Map LLActor String
+	-- |assignments. We first accumulate them, then realize. That allows us to have declarations before
+	-- any assignment will be made.
+	, cgsAssignments	:: [(VarID, SizedLFE)]
 	}
 	deriving (Eq, Ord, Show)
 
@@ -648,6 +671,7 @@ startCGState lang = CGState {
 	, cgsCurrentActor	= error "no current actor is set."
 	, cgsUsedActorNames	= Set.empty
 	, cgsActorsVisited	= Map.empty
+	, cgsAssignments	= []
 	}
 
 type CGM a = State CGState a
@@ -723,6 +747,10 @@ genModule un ins outs clocks compileRules = do
 		VHDL -> do
 			genLine "VHDL QQ"
 	compileRules
+	assignments <- liftM cgsAssignments get
+	let decls = accumDecls assignments
+	genDecls $ Map.toList decls
+	forM_ assignments $ \(v,e) -> genAssignText v e
 	case l of
 		Verilog -> do
 			genNL
@@ -736,14 +764,105 @@ genModule un ins outs clocks compileRules = do
 		vlSize = take 16 . vlSize'
 		vlSize' 1 = repeat ' '
 		vlSize' n = printf "[%d:0]" (fromNatI (n-1))++ repeat ' '
+		exprDecls (sz,LFEConst _) = []
+		exprDecls (sz, LFEVar v) = [Map.singleton v sz]
+		exprDecls (sz,e) = internal $ "exprDecls "++show e
+		assignDecls (v, e@(sz, _)) = Map.singleton v sz : exprDecls e
+		accumDecls assigns = Map.unionsWith checkInvalidDups $ concatMap assignDecls assigns
+		checkInvalidDups sz1 sz2
+			| sz1 /= sz2 = internal $ "checkInvalidDups: "++show (sz1, sz2)
+			| otherwise = sz1
+
+genDecls :: [(VarID, NatI)] -> CGM ()
+genDecls decls = do
+	forM_ decls $ \(v,sz) -> case sz of
+		0 -> return ()
+		1 -> genLine $ unwords ["wire", varText v, ";"]
+		sz -> genLine $ unwords ["wire [", show (sz-1),": 0 ]", varText v, ";"]
+	return ()
 
 genCompileRules :: String -> ClockInfo -> [SizedLFE] -> [SizedLFE] -> Map.Map VarID SizedLFE -> [Rules] -> CGM ()
-genCompileRules name ci ins outs initials [] = internal $ "no rules for "++name++"."
 genCompileRules name ci ins outs initials [Rules rulesType hLeft hRight matches] = do
 	genComment "Rules - single instance."
-	
+	genCompileMatches rulesType hLeft hRight matches
+	return ()
 genCompileRules name ci ins outs initials manyRules = do
 	internal $ "multiple rules aren't supported. actor "++name
+
+varText :: VarID -> String
+varText (VarID n ns kind) = underscoredIndices (fromMaybe "fevar_auto_gen" n) ns kind
+
+exprText :: Language -> SizedLFE -> String
+exprText l (sz,e) = case l of
+	Verilog -> vlogText
+	VHDL -> vhdlText
+	where
+		bits n x
+			| n > 0 || x > 0 = bits (max 0 (n-1)) (div x 2) ++ show (mod x 2)
+			| otherwise = ""
+		vlogText = case e of
+			LFEVar v -> varText v
+			LFEConst c -> concat [show sz,"'", bits sz $ fromBitVectConst c]
+			e -> internal $ "exprText Verilog: "++show e
+		vhdlText = case e of
+			e -> internal $ "exprText VHDL: "++show e
+
+genUnique :: CGM Int
+genUnique = do
+	modify $ \cgs -> cgs { cgsUnique = cgsUnique cgs + 1 }
+	liftM cgsUnique get
+
+genCloneVar :: VarID -> CGM VarID
+genCloneVar (VarID n ns k) = do
+	i <- genUnique
+	return $ VarID n (ns++[i]) k
+
+genAssignText :: VarID -> SizedLFE -> CGM ()
+genAssignText v e = do
+	l <- genLanguage
+	let eText = exprText l e
+	genLine $ case l of
+		Verilog -> unwords ["assign", varText v, "=", eText,";"]
+		VHDL -> "assignment !!!"
+	return ()
+
+genAssign :: VarID -> SizedLFE -> CGM SizedLFE
+genAssign v e = do
+	modify $ \cgs -> cgs { cgsAssignments = (v,e) : cgsAssignments cgs }
+	return (fst e, LFEVar v)
+
+genCompileMatches :: RulesType -> [SizedLFE] -> [SizedLFE] -> [([SizedLFE], [SizedLFE])] -> CGM ()
+genCompileMatches ruleType from to matchChanges = do
+	firesReadys <- forM matchChanges $ \(match, change) -> do
+		let matchValid = foldAnd $ matchsValid match
+		matched <- matchAssignments [] from match
+		return (lfeAnd matchValid matched, lfeFalse)
+	return ()
+	where
+		foldAnd [] = lfeTrue
+		foldAnd [e] = e
+		foldAnd es = foldAnd (by2 es)
+			where
+				by2 [] = []
+				by2 [e] = [e]
+				by2 (x:y:es) = lfeAnd x y : by2 es
+		fromValids = map lfeValid from
+		toReady = map lfeReady to
+		matchsValid match = concat $ zipWith matchValid fromValids match
+		matchValid valid (_,e) = case e of
+			LFEWild -> []	-- do not care for "valid" signal for wildcards.
+			_ -> [valid]	-- all other patterns require valid signal.
+		matchAssignments fires [] [] = return (foldAnd fires)
+		matchAssignments fires (fromE:fromEs) (matchE:matchEs) = do
+			f <- genMatchAssignments (snd fromE) matchE
+			matchAssignments (fires ++ f) fromEs matchEs
+		genMatchAssignments e@(LFEVar v) (n, LFEConst c) = do
+			v' <- genCloneVar v
+			genAssign v' (lfeEqual (n, LFEVar v) (n, LFEConst c))
+			return [(1, LFEVar v')]
+		genMatchAssignments e@(LFEVar v) (n, LFEVar v') = do
+			genAssign v' (n, e)
+			return []
 
 -- |Generate code from actor (either just an actor or network).
 generateCode :: Language -> Actor ins outs -> ([String], String)
